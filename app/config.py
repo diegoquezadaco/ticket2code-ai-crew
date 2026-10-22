@@ -58,7 +58,7 @@ def get_settings() -> Settings:
         fallback_api_key=os.getenv("FALLBACK_API_KEY", ""),
         fallback_base_url=os.getenv("FALLBACK_BASE_URL", ""),
         fallback_model=os.getenv("FALLBACK_MODEL", ""),
-        max_retries=max(0, _int("MAX_RETRIES", 2)),
+        max_retries=max(0, _int("MAX_RETRIES", 5)),
         llm_timeout=_float("LLM_TIMEOUT_SECONDS", 60),
-        max_sessions=_int("MAX_SESSIONS", 200),
+        max_sessions=_int("MAX_SESSIONS", 400),
     )

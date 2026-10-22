@@ -151,7 +151,7 @@ def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
         f"Plan:\n{json.dumps(plan, ensure_ascii=False)}\n\n"
         f"Automated syntax checks: passed\n\nFiles:\n{render_files(files)}"
     )
-    r = llm.chat_json("reviewer", REVIEWER_SYS, user, required=("approved",), max_tokens=700)
+    r = llm.chat_json("reviewer", REVIEWER_SYS, user, required=("approved",), max_tokens=1000)
     raw_issues = r.get("issues")
     issues = [str(i).strip() for i in raw_issues if str(i).strip()] if isinstance(raw_issues, list) else []
     approved = (r.get("approved") is True or str(r.get("approved")).lower() == "true") and not issues
