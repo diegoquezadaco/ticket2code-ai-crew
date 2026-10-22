@@ -7,15 +7,18 @@ import re
 
 from .llm import LLMClient, LLMError
 
-INTENTS = ("new_ticket", "change_request", "question", "chat")
 LANG_NAMES = {"es": "Spanish", "en": "English"}
+INTENTS = ("new_ticket", "change_request", "question", "chat", "clarification")
 
 ROUTER_SYS = (
     "You route messages in a chat with a code-delivery assistant. Given the recent conversation and a "
     "summary of the last delivered work (or 'none'), classify the latest user message.\n"
-    "Intents: new_ticket (a feature request unrelated to previous work), change_request (modify, extend or "
-    "fix the previous work, e.g. 'add X too'), question (asks about delivered work, the plan or past "
-    "decisions), chat (greeting or off-topic).\n"
+    "Intents: \n"
+    "- new_ticket (a clear feature request unrelated to previous work),\n"
+    "- change_request (modify, extend or fix the previous work),\n"
+    "- question (asks about delivered work, the plan or past decisions),\n"
+    "- chat (greeting or off-topic),\n"
+    "- clarification (the user's request is too ambiguous, lacks essential technical details, or requires critical choices before planning).\n"
     'Reply ONLY JSON: {"intent": "...", "lang": "es" or "en", "reason": "short"}'
 )
 
@@ -51,8 +54,27 @@ REVIEWER_SYS = (
 ASSISTANT_SYS = (
     "You are the assistant of a code-delivery chat. Answer the user's message using the delivered work, the "
     "plan and the conversation. Be concise and answer in the user's language. If nothing has been delivered "
-    "yet, say so and invite the user to send a ticket."
+    "yet, say so and invite the user to send a ticket.\n\n"
+    "CRITICAL DELIVERY INSTRUCTIONS:\n"
+    "When code has been successfully delivered, approved, or when the user asks how to proceed, your response MUST include:\n"
+    "1. **Árbol de archivos**: Una representación visual limpia de la estructura de carpetas y archivos entregados.\n"
+    "2. **Paso a paso**: Instrucciones claras, prácticas y secuenciales para que el usuario pueda instalar, ejecutar, probar o continuar trabajando con el código en su entorno local."
 )
+
+
+def answer(llm: LLMClient, message: str, history: list, plan, files: dict, open_issues: list) -> str:
+    # Generamos el árbol de archivos para inyectarlo en el contexto del asistente
+    file_tree = generate_file_tree(files) if files else "none"
+    
+    user = (
+        f"Conversation:\n{_history_text(history)}\n\n"
+        f"Last plan: {json.dumps(plan, ensure_ascii=False) if plan else 'none'}\n\n"
+        f"File Tree Structure:\n{file_tree}\n\n"
+        f"Delivered files:\n{render_files(files, 8000)}\n\n"
+        f"Unresolved issues: {open_issues or 'none'}\n\nUser message:\n{message}"
+    )
+    # Aumentamos ligeramente max_tokens para asegurar que entre el paso a paso detallado
+    return llm.chat_text("assistant", ASSISTANT_SYS, user, max_tokens=1000, temperature=0.3)
 
 
 def _history_text(history: list) -> str:
@@ -144,6 +166,27 @@ def write_code(llm: LLMClient, plan: dict, files: dict, feedback, attempt: int):
         user += "\n\nYour previous reply did not follow the required `### FILE:` format. Output the files again in that format."
     raise LLMError("the Coder returned no parseable files")
 
+def generate_file_tree(files: dict) -> str:
+    """Genera una representación visual tipo árbol de archivos a partir de las rutas."""
+    tree = {}
+    for path in files.keys():
+        parts = path.split("/")
+        current = tree
+        for part in parts:
+            current = current.setdefault(part, {})
+            
+    def _build_lines(node, prefix=""):
+        lines = []
+        items = sorted(node.items())
+        for i, (name, subtree) in enumerate(items):
+            connector = "└── " if i == len(items) - 1 else "├── "
+            lines.append(f"{prefix}{connector}{name}")
+            if subtree:
+                extension = "    " if i == len(items) - 1 else "│   "
+                lines.extend(_build_lines(subtree, prefix + extension))
+        return lines
+
+    return "\n".join(["project_root/"] + _build_lines(tree))
 
 def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
     user = (
