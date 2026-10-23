@@ -39,6 +39,35 @@
   #send { font:inherit; padding:0 18px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
   #send:disabled { opacity:.5; cursor:wait; }
   .hint { color:var(--muted); font-size:13px; }
+  .code-block { position: relative; margin: 8px 0; }
+  .code-block pre {
+    margin: 0;
+    padding: 36px 12px 12px;
+    max-height: 360px;
+    overflow: auto;
+    background: var(--code);
+    border-radius: 8px;
+  }
+  .copy-code {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .markdown p { margin: 8px 0; }
+  .markdown h1, .markdown h2, .markdown h3,
+  .markdown h4, .markdown h5, .markdown h6 { margin: 16px 0 6px; line-height: 1.25; }
+  .markdown ul { margin: 6px 0; padding-left: 24px; }
+  .markdown .md-step { display: flex; gap: 6px; margin: 6px 0; }
+  .markdown .md-step-number { flex: 0 0 auto; font-weight: 600; }
+  .markdown code.inline-code { padding: 1px 5px; border-radius: 4px; background: var(--code); }
+  .code-language { position: absolute; top: 9px; left: 12px; color: var(--muted); font-size: 11px; }
+  .copy-code { z-index: 1; }
 </style>
 </head>
 <body>
@@ -64,26 +93,196 @@ if (!sessionId || sessionId.length < 8) newSession();
 function el(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
 function scroll() { chat.scrollTop = chat.scrollHeight; }
 
-function renderReply(parent, text) {
-  const re = /```(\w*)\n([\s\S]*?)```/g; let last = 0, m;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) parent.appendChild(el('div', 'text', text.slice(last, m.index).trim()));
-    parent.appendChild(el('pre', '', m[2]));
-    last = re.lastIndex;
+function addRow(parent, event) {
+  const row = el('div', 'row');
+  row.appendChild(el('span', 't', `${event.t ?? ''}s`));
+  row.appendChild(el('span', `a ${event.agent || 'system'}`, event.agent || 'system'));
+  row.appendChild(document.createTextNode(event.message || ''));
+
+  if (event.data !== undefined) {
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'Detalles';
+    const pre = document.createElement('pre');
+    pre.textContent = typeof event.data === 'string'
+      ? event.data
+      : JSON.stringify(event.data, null, 2);
+
+    details.append(summary, pre);
+    row.appendChild(details);
   }
-  if (last < text.length) parent.appendChild(el('div', 'text', text.slice(last).trim()));
+
+  parent.appendChild(row);
 }
 
-function addRow(list, ev) {
-  const row = el('div', 'row');
-  row.appendChild(el('span', 't', ev.t + 's'));
-  row.appendChild(el('span', 'a ' + ev.agent, ev.agent));
-  row.appendChild(el('span', '', ev.message));
-  if (ev.data) {
-    const d = el('details'); d.appendChild(el('summary', 'hint', 'detalle'));
-    d.appendChild(el('pre', '', JSON.stringify(ev.data, null, 2))); row.appendChild(d);
+function appendInline(parent, text) {
+  const token = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g;
+  let last = 0, match;
+
+  while ((match = token.exec(text)) !== null) {
+    parent.appendChild(document.createTextNode(text.slice(last, match.index)));
+    const value = match[0];
+
+    if (value.startsWith('**')) {
+      const strong = document.createElement('strong');
+      strong.textContent = value.slice(2, -2);
+      parent.appendChild(strong);
+    } else if (value.startsWith('`')) {
+      const code = document.createElement('code');
+      code.className = 'inline-code';
+      code.textContent = value.slice(1, -1);
+      parent.appendChild(code);
+    } else {
+      const em = document.createElement('em');
+      em.textContent = value.slice(1, -1);
+      parent.appendChild(em);
+    }
+    last = token.lastIndex;
   }
-  list.appendChild(row);
+
+  parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function renderReply(parent, text) {
+  parent.classList.add('markdown');
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  let paragraph = [];
+  let list = null;
+
+  function flushParagraph() {
+    if (!paragraph.length) return;
+    const p = document.createElement('p');
+    appendInline(p, paragraph.join(' '));
+    parent.appendChild(p);
+    paragraph = [];
+  }
+
+  function flushList() {
+    if (list) {
+      parent.appendChild(list);
+      list = null;
+    }
+  }
+
+  function renderCode(codeLines, language) {
+    const code = codeLines.join('\n').replace(/\n+$/, '');
+    const block = el('div', 'code-block');
+    const pre = document.createElement('pre');
+    const codeElement = document.createElement('code');
+    codeElement.textContent = code;
+    pre.appendChild(codeElement);
+
+    const label = language ? el('span', 'code-language', language) : null;
+    const button = el('button', 'copy-code', '⧉');
+    button.type = 'button';
+    button.title = 'Copiar código';
+    button.setAttribute('aria-label', 'Copiar código');
+
+    button.addEventListener('click', async () => {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(code);
+        } else {
+          const textarea = document.createElement('textarea');
+          textarea.value = code;
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.select();
+          const copied = document.execCommand('copy');
+          textarea.remove();
+          if (!copied) throw new Error('Copy command failed');
+        }
+        button.textContent = '✓';
+        setTimeout(() => { button.textContent = '⧉'; }, 1200);
+      } catch (error) {
+        button.title = 'No se pudo copiar';
+        console.error('Could not copy code:', error);
+      }
+    });
+
+    if (label) block.appendChild(label);
+    block.append(button, pre);
+    parent.appendChild(block);
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const opening = lines[i].match(/^\s*(`{3,}|~{3,})\s*([^\s]*)?.*$/);
+
+    if (opening) {
+      flushParagraph();
+      flushList();
+
+      const marker = opening[1][0];
+      const markerLength = opening[1].length;
+      const language = (opening[2] || '').trim();
+      const codeLines = [];
+      i++;
+
+      while (i < lines.length) {
+        const closing = lines[i].match(/^\s*(`+|~+)\s*$/);
+        if (closing && closing[1][0] === marker && closing[1].length >= markerLength) break;
+        codeLines.push(lines[i]);
+        i++;
+      }
+
+      // Quita la indentación común de bloques anidados en listas Markdown.
+      const indents = codeLines
+        .filter(line => line.trim())
+        .map(line => line.match(/^\s*/)[0].length);
+      const indent = indents.length ? Math.min(...indents) : 0;
+      renderCode(codeLines.map(line => line.slice(indent)), language);
+      continue;
+    }
+
+    if (!lines[i].trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = lines[i].match(/^\s*(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const h = document.createElement(`h${heading[1].length}`);
+      appendInline(h, heading[2]);
+      parent.appendChild(h);
+      continue;
+    }
+
+    const step = lines[i].match(/^\s*(\d+)[.)]\s+(.+)$/);
+    if (step) {
+      flushParagraph();
+      flushList();
+      const item = el('div', 'md-step');
+      item.appendChild(el('span', 'md-step-number', `${step[1]}.`));
+      const content = document.createElement('span');
+      appendInline(content, step[2]);
+      item.appendChild(content);
+      parent.appendChild(item);
+      continue;
+    }
+
+    const bullet = lines[i].match(/^\s*[-*+]\s+(.+)$/);
+    if (bullet) {
+      flushParagraph();
+      if (!list || list.tagName !== 'UL') {
+        flushList();
+        list = document.createElement('ul');
+      }
+      const item = document.createElement('li');
+      appendInline(item, bullet[1]);
+      list.appendChild(item);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(lines[i].trim());
+  }
+
+  flushParagraph();
+  flushList();
 }
 
 async function sendMessage(text) {

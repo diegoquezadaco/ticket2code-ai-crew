@@ -17,6 +17,7 @@ class Session:
     lang: str = "en"
     runs: list = field(default_factory=list)           # trace of every turn
     lock: threading.Lock = field(default_factory=threading.Lock)
+    pending_clarification: dict | None = None
 
 
 class SessionStore:

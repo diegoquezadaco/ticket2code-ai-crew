@@ -31,6 +31,7 @@ class Settings:
     planner_model: str
     coder_model: str
     reviewer_model: str
+    documentarian_model: str
     fallback_api_key: str
     fallback_base_url: str
     fallback_model: str
@@ -43,6 +44,7 @@ class Settings:
             "planner": self.planner_model,
             "coder": self.coder_model,
             "reviewer": self.reviewer_model,
+            "documentarian": self.documentarian_model,
         }
         return per_role.get(role) or self.model
 
@@ -55,6 +57,7 @@ def get_settings() -> Settings:
         planner_model=os.getenv("PLANNER_MODEL", ""),
         coder_model=os.getenv("CODER_MODEL", ""),
         reviewer_model=os.getenv("REVIEWER_MODEL", ""),
+        documentarian_model=os.getenv("DOCUMENTARIAN_MODEL", ""),
         fallback_api_key=os.getenv("FALLBACK_API_KEY", ""),
         fallback_base_url=os.getenv("FALLBACK_BASE_URL", ""),
         fallback_model=os.getenv("FALLBACK_MODEL", ""),
