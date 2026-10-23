@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import random
 
 from openai import (
     APIConnectionError,
@@ -27,16 +28,29 @@ class LLMError(Exception):
 def parse_json(text: str) -> dict:
     """Parse a JSON object from model output, tolerating code fences and extra prose."""
     text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text).strip()
+
     try:
         obj = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.S)
-        if not match:
-            raise ValueError("no JSON object found")
-        obj = json.loads(match.group(0))
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+
+            try:
+                obj, _ = decoder.raw_decode(text[index:])
+                break
+            except json.JSONDecodeError:
+                continue
+        else:
+            raise ValueError("no valid JSON object found") from original_error
+
     if not isinstance(obj, dict):
         raise ValueError("JSON root is not an object")
+
     return obj
 
 
@@ -55,14 +69,34 @@ def _retry_after(e: Exception, attempt: int) -> float:
 class LLMClient:
     def __init__(self, settings: Settings):
         self.s = settings
-        self._primary = self._make(settings.api_key, settings.base_url)
-        has_fallback = settings.fallback_base_url and settings.fallback_model
-        self._fallback = self._make(settings.fallback_api_key, settings.fallback_base_url) if has_fallback else None
+        self._primary = self._make(
+            settings.api_key,
+            settings.base_url,
+            settings.llm_timeout,
+        )
 
-    def _make(self, key: str, url: str):
+        has_fallback = settings.fallback_base_url and settings.fallback_model
+
+        self._fallback = (
+            self._make(
+                settings.fallback_api_key,
+                settings.fallback_base_url,
+                settings.fallback_timeout,
+            )
+            if has_fallback
+            else None
+        )
+
+    def _make(self, key: str, url: str, timeout: float):
         if not key:
             return None
-        return OpenAI(api_key=key, base_url=url, timeout=self.s.llm_timeout, max_retries=0)
+
+        return OpenAI(
+            api_key=key,
+            base_url=url,
+            timeout=timeout,
+            max_retries=0,
+        )
 
     @property
     def configured(self) -> bool:
@@ -84,42 +118,95 @@ class LLMClient:
                 errors.append(f"{model}: {e}")
         raise LLMError(" | ".join(errors))
 
-    def _call(self, client, model, system, user, max_tokens, json_mode, temperature) -> str:
-        kwargs = dict(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+    def _call(
+        self,
+        client,
+        model,
+        system,
+        user,
+        max_tokens,
+        json_mode,
+        temperature,
+    ) -> str:
+        kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
-        last = "unknown error"
-        for attempt in range(3):
+
+        max_attempts = 3
+        last_error = "unknown error"
+
+        for attempt in range(max_attempts):
             try:
-                resp = client.chat.completions.create(**kwargs)
-                text = (resp.choices[0].message.content or "").strip()
-                if text:
-                    return text
-                last = "empty response"
+                response = client.chat.completions.create(**kwargs)
+                content = response.choices[0].message.content or ""
+                content = content.strip()
+
+                if content:
+                    return content
+
+                last_error = "empty response"
+
             except RateLimitError as e:
-                last = "rate limit reached"
-                time.sleep(_retry_after(e, attempt))
-            except (APITimeoutError, APIConnectionError):
-                last = f"timeout or connection error (limit {self.s.llm_timeout:.0f}s)"
-                time.sleep(1 + attempt)
+                # No insistir inmediatamente contra el mismo límite.
+                raise LLMError(
+                    f"rate limit reached: {_msg(e)}"
+                ) from e
+
             except BadRequestError as e:
-                if "response_format" in kwargs:  # model without JSON mode: retry without it
+                detail = _msg(e)
+
+                # Intentar sin JSON mode únicamente si el error
+                # parece estar relacionado con esa opción.
+                if (
+                    "response_format" in kwargs
+                    and any(
+                        term in detail.lower()
+                        for term in (
+                            "response_format",
+                            "json_object",
+                            "json mode",
+                            "structured output",
+                        )
+                    )
+                ):
                     kwargs.pop("response_format")
-                    last = "json mode not supported"
+                    last_error = f"JSON mode unsupported: {detail}"
                     continue
-                raise LLMError(f"bad request: {_msg(e)}") from e
+
+                raise LLMError(
+                    f"bad request: {detail}"
+                ) from e
+
+            except (APITimeoutError, APIConnectionError) as e:
+                last_error = (
+                    f"connection/timeout error: {type(e).__name__}"
+                )
+
             except APIStatusError as e:
-                if e.status_code >= 500:
-                    last = f"server error {e.status_code}"
-                    time.sleep(1 + attempt)
-                else:  # 401 bad key, 404 unknown model, ...: retrying will not help
-                    raise LLMError(f"HTTP {e.status_code}: {_msg(e)}") from e
-        raise LLMError(f"{last} after 3 attempts")
+                if e.status_code < 500:
+                    raise LLMError(
+                        f"HTTP {e.status_code}: {_msg(e)}"
+                    ) from e
+
+                last_error = f"server error {e.status_code}"
+
+            # No esperar después del último intento.
+            if attempt < max_attempts - 1:
+                delay = min(2 ** attempt, 8)
+                time.sleep(delay + random.uniform(0, 0.5))
+
+        raise LLMError(
+            f"{last_error} after {max_attempts} attempts"
+        )
 
     def chat_json(self, role: str, system: str, user: str, required=(), max_tokens: int = 1200) -> dict:
         raw = self.chat_text(role, system, user, max_tokens=max_tokens, json_mode=True, temperature=0)

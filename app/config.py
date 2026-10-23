@@ -38,6 +38,7 @@ class Settings:
     max_retries: int  # Coder retries after the first attempt
     llm_timeout: float
     max_sessions: int
+    fallback_timeout: float
 
     def model_for(self, role: str) -> str:
         per_role = {
@@ -53,7 +54,7 @@ def get_settings() -> Settings:
     return Settings(
         api_key=os.getenv("LLM_API_KEY", ""),
         base_url=os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
-        model=os.getenv("LLM_MODEL", "openai/gpt-oss-120b"),
+        model=os.getenv("LLM_MODEL", "openai/gpt-oss-20b"),
         planner_model=os.getenv("PLANNER_MODEL", ""),
         coder_model=os.getenv("CODER_MODEL", ""),
         reviewer_model=os.getenv("REVIEWER_MODEL", ""),
@@ -63,5 +64,6 @@ def get_settings() -> Settings:
         fallback_model=os.getenv("FALLBACK_MODEL", ""),
         max_retries=max(0, _int("MAX_RETRIES", 5)),
         llm_timeout=_float("LLM_TIMEOUT_SECONDS", 60),
+        fallback_timeout=_float("FALLBACK_TIMEOUT_SECONDS", 90),
         max_sessions=_int("MAX_SESSIONS", 400),
     )
