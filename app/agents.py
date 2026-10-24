@@ -32,6 +32,7 @@ PLANNER_SYS = (
     'Return ONLY JSON: {"title":str,"language":str,"assumptions":[str],"questions":[str],'
     '"tasks":[{"id":int,"title":str,"details":str}],"acceptance_criteria":[str]}. '
     "When proceeding, provide 3-6 tasks and 3-6 acceptance criteria."
+    "When asked to build a game, refer to existing implementations and do not invent new game mechanics."
 )
 
 CODER_SYS = (
@@ -181,6 +182,7 @@ _FILE_RE = re.compile(r"###\s*FILE:\s*`?([^\n`]+?)`?\s*\n```[^\n]*\n(.*?)\n?```"
 
 
 def parse_files(text: str) -> dict:
+    """Parse generated file blocks and ignore unsafe relative paths."""
     files = {}
     for path, content in _FILE_RE.findall(text):
         path = path.strip().replace("\\", "/")
@@ -254,7 +256,7 @@ def apply_edit_blocks(
     return updated, sorted(set(changed_paths)), None
 
 def generate_file_tree(files: dict) -> str:
-    """Genera una representación visual tipo árbol de archivos de manera determinista."""
+    """Build a deterministic tree representation of project files."""
     if not files:
         return "(no files)"
     tree = {}
@@ -279,7 +281,7 @@ def generate_file_tree(files: dict) -> str:
 
 
 def get_deterministic_commands(files: dict) -> dict:
-    """Calcula de forma determinista los comandos de instalación, ejecución y pruebas."""
+    """Infer deterministic install, run, and test commands from project files."""
     commands = {"install": [], "run": [], "test": []}
     names = list(files)
     contents = "\n".join(files.values())
@@ -331,6 +333,7 @@ def static_checks(files: dict) -> list:
 
 
 def route(llm: LLMClient, message: str, history: list, summary: str) -> dict:
+    """Classify the request and normalize router output."""
     user = (
         f"Last delivered work: {summary or 'none'}\n\n"
         f"Recent conversation:\n{_history_text(history)}\n\nLatest user message:\n{message}"
@@ -342,7 +345,7 @@ def route(llm: LLMClient, message: str, history: list, summary: str) -> dict:
     if not isinstance(questions, list):
         questions = []
 
-    # Normalize and cap model output so the UI only presents up to five questions.
+    # Cap router output so the UI presents no more than five questions.
     clean_questions = []
     for item in questions[:5]:
         if not isinstance(item, dict) or not str(item.get("question", "")).strip():
@@ -369,6 +372,7 @@ def route(llm: LLMClient, message: str, history: list, summary: str) -> dict:
 
 
 def make_plan(llm: LLMClient, request: str, lang: str, prior_plan, files: dict, open_issues: list) -> dict:
+    """Build a plan, including prior delivery context for change requests."""
     context = ""
     if prior_plan:
         context = (
@@ -412,6 +416,7 @@ def write_code(
     feedback,
     attempt: int,
 ):
+    """Generate project files or apply reviewer feedback to existing files."""
     import logging
 
     logger = logging.getLogger(__name__)
@@ -440,9 +445,7 @@ def write_code(
         else ""
     )
 
-    # ---------------------------------------------------------
-    # Retry attempts: ask for SEARCH / REPLACE edit blocks.
-    # ---------------------------------------------------------
+    # Use precise edit blocks on retries to reduce prompt size.
     if attempt >= 2 and files:
         edit_user = (
             f"Plan:\n{plan_context}\n\n"
@@ -514,10 +517,7 @@ def write_code(
             edit_error,
         )
 
-    # ---------------------------------------------------------
-    # First attempt, or fallback when edits cannot be applied:
-    # request complete files.
-    # ---------------------------------------------------------
+    # Request complete files for the first attempt or edit fallback.
     user = (
         f"Plan:\n{plan_context}\n\n"
         f"Current files:\n{render_files(files, 12000)}"
@@ -577,14 +577,14 @@ def review(
     previous_files: dict | None = None,
     previous_issues: list[str] | None = None,
 ) -> dict:
+    """Review implementation changes against the plan and acceptance criteria."""
     review_files = {
         path: content
         for path, content in files.items()
         if path.rsplit("/", 1)[-1].lower() != "readme.md"
     }
 
-    # Keep only task titles and acceptance criteria.
-    # Task details and assumptions are unnecessary for this review.
+    # Keep review context focused on tasks and acceptance criteria.
     compact_plan = {
         "title": plan.get("title", ""),
         "tasks": [
@@ -745,6 +745,7 @@ def document_project(
     lang: str,
     feedback: list[str] | None = None,
 ) -> str:
+    """Generate and normalize project README content."""
     doc_files = {
         path: content
         for path, content in files.items()
@@ -798,8 +799,7 @@ def document_project(
         )
         readme = extract_readme(text)
 
-    # Algunos modelos ignoran el sobre. Conserva su respuesta para entregar el README
-    # en lugar de detener el pipeline y perder el resto de los archivos.
+    # Preserve non-empty output when a model ignores the required markers.
     if readme is None and text.strip():
         readme = text.strip() + "\n"
 
@@ -841,6 +841,7 @@ def document_project(
 
 
 def answer(llm: LLMClient, message: str, history: list, plan, files: dict, open_issues: list) -> str:
+    """Answer a question using the current project and conversation context."""
     file_tree = generate_file_tree(files)
     commands = get_deterministic_commands(files)
     
@@ -856,11 +857,10 @@ def answer(llm: LLMClient, message: str, history: list, plan, files: dict, open_
 
 
 def handle_chat_message(llm: LLMClient, message: str, history: list, summary: str, plan, files: dict, open_issues: list) -> str:
-    """Función de orquestación principal que maneja la intención de aclaración y rutas."""
+    """Route chat and clarification requests using the conversation context."""
     routing = route(llm, message, history, summary)
     intent = routing["intent"]
     
-    # 2. Manejar la intención de aclaración directamente sin disparar el ticket/planner
     if intent == "clarification":
         clarification_prompt = (
             f"The user request was deemed ambiguous. Ask concise clarifying questions to gather necessary details.\n"
@@ -871,7 +871,6 @@ def handle_chat_message(llm: LLMClient, message: str, history: list, summary: st
     elif intent in ("question", "chat"):
         return answer(llm, message, history, plan, files, open_issues)
         
-    # Si es new_ticket o change_request, aquí continuaría tu pipeline normal...
     return routing
 
 

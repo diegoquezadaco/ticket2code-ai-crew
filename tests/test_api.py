@@ -1,3 +1,5 @@
+"""Tests for HTTP endpoints, streamed chat responses, and project downloads."""
+
 import io
 import json
 import zipfile

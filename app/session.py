@@ -1,4 +1,4 @@
-"""In-memory conversation state. Free hosts have ephemeral disks, so memory is enough for the MVP."""
+"""In-memory conversation state and bounded session storage."""
 from __future__ import annotations
 
 import threading
@@ -8,19 +8,23 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Session:
+    """Conversation context and latest generated delivery for one browser session."""
+
     id: str
-    history: list = field(default_factory=list)       # compact [{"role","content"}]
-    plan: dict | None = None                           # plan of the last delivery
-    files: dict = field(default_factory=dict)          # path -> content of the last delivery
-    open_issues: list = field(default_factory=list)    # unresolved reviewer issues
-    summary: str = ""                                  # one-line description of the last delivery
+    history: list = field(default_factory=list)
+    plan: dict | None = None
+    files: dict = field(default_factory=dict)
+    open_issues: list = field(default_factory=list)
+    summary: str = ""
     lang: str = "en"
-    runs: list = field(default_factory=list)           # trace of every turn
+    runs: list = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     pending_clarification: dict | None = None
 
 
 class SessionStore:
+    """Keep a least-recently-used set of sessions in process memory."""
+
     def __init__(self, max_sessions: int = 200):
         self._items: OrderedDict[str, Session] = OrderedDict()
         self._lock = threading.Lock()

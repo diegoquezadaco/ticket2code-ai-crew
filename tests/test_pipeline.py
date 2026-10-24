@@ -1,3 +1,5 @@
+"""Tests for the agent pipeline, delivery formatting, and documentation."""
+
 from dataclasses import replace
 
 from app import agents

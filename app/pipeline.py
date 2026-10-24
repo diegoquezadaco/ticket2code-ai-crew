@@ -19,7 +19,6 @@ from .session import Session
 
 log = logging.getLogger(__name__)
 
-# Etiquetas ampliadas para incluir secciones de entrega
 LABELS = {
     "es": {
         "approved": "Aprobado por el Reviewer en el intento {n}.",
@@ -61,6 +60,7 @@ def format_reply(
     issues: list,
     failure: str | None = None,
 ) -> str:
+    """Format the final response with setup steps and generated files."""
     L = LABELS[lang]
     if failure:
         partial_title = (
@@ -78,11 +78,9 @@ def format_reply(
     if not approved and issues:
         parts.append(L["pending"] + ":\n" + "\n".join(f"- {i}" for i in issues))
         
-    # 1. Agregar el Árbol de Archivos de manera determinista
     tree_str = generate_file_tree(files)
     parts.append(f"### {L['file_tree']}:\n```text\n{tree_str}\n```")
     
-    # 2. Agregar el Paso a Paso determinista
     commands = get_deterministic_commands(files)
     step_lines = []
     if files:
@@ -144,7 +142,6 @@ def format_reply(
 
     parts.append(f"### {L['steps']}:\n" + "\n".join(step_lines))
 
-    # 3. Listado completo de archivos generados
     parts.append(L["files"] + ":")
     for path, content in files.items():
         ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
@@ -162,12 +159,12 @@ def format_reply(
 
 
 def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterator[dict]:
+    """Run one chat turn and yield progress events followed by a result."""
     t0 = time.perf_counter()
 
     events: list = []
     stage = "router"
 
-    # Initialize all state before entering the pipeline.
     intent = "unknown"
     lang = session.lang if session.lang in LABELS else "es"
     plan = session.plan or {}
@@ -203,8 +200,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             if not text:
                 return []
 
-            # Some model responses serialize a dictionary as a string
-            # inside code_issues. Parse only Python literals; never use eval().
+            # Parse serialized findings as literals; never evaluate model output.
             if text.startswith("{") and text.endswith("}"):
                 try:
                     parsed = ast.literal_eval(text)
@@ -217,7 +213,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             return [text]
 
         if isinstance(value, dict):
-            # Support common reviewer/checker schemas.
             preferred_fields = (
                 "description",
                 "issue",
@@ -257,13 +252,10 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
     try:
         prior_history = list(session.history)
 
-        # ---------------------------------------------------------
-        # 1. Router / clarification
-        # ---------------------------------------------------------
+        # Route the request and handle clarification.
         pending = session.pending_clarification
 
         if pending:
-            # Continue from the one permitted clarification round.
             session.pending_clarification = None
             lang = pending["lang"]
             intent = pending["intent"]
@@ -366,9 +358,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
 
         yield log_event("router", f"intent: {intent}", route)
 
-        # ---------------------------------------------------------
-        # 2. Handle normal questions and chat
-        # ---------------------------------------------------------
         if intent in ("question", "chat"):
             stage = "assistant"
             stage_started = time.perf_counter()
@@ -406,9 +395,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             }
             return
 
-        # ---------------------------------------------------------
-        # 3. Planner
-        # ---------------------------------------------------------
         is_change = intent == "change_request"
         stage = "planner"
         stage_started = time.perf_counter()
@@ -476,14 +462,8 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
 
         delivery_files = dict(files)
 
-        # =========================================================
-        # 4. IMPLEMENTATION RETRY LOOP
-        #
-        # Coder -> static checks -> reviewer
-        #
-        # The documentarian and documentation checks must not run
-        # anywhere inside this loop.
-        # =========================================================
+        # Retry implementation through coding, static checks, and review.
+        # Documentation runs only after the implementation is approved.
         feedback_code: list[str] = []
         approved = False
         issues = []
@@ -496,11 +476,8 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
         for attempt in range(1, max_attempts + 1):
             attempts = attempt
 
-            # -----------------------------------------------------
-            # 4a. Coder
-            # -----------------------------------------------------
+            # Generate or revise project files.
             stage = "coder"
-            # Snapshot the implementation and issues before this attempt changes anything.
             previous_files = dict(files)
             previous_issues = list(feedback_code)
 
@@ -537,7 +514,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             except Exception as exc:
                 generation_error = str(exc)
 
-                # Restore the last successfully generated files.
                 files = dict(last_successful_files)
                 delivery_files = dict(last_successful_files)
 
@@ -555,7 +531,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     },
                 )
 
-                # Exit the implementation loop and continue to finalization.
                 break
             finally:
                 log.info(
@@ -572,8 +547,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 if not is_readme(path)
             })
 
-            # Remove any README that might have been inherited or
-            # returned accidentally.
             files = {
                 path: content
                 for path, content in files.items()
@@ -581,7 +554,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             }
 
             delivery_files = dict(files)
-            # Save the latest successfully generated source and test files.
             last_successful_files = dict(files)
 
             yield log_event(
@@ -591,9 +563,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 {"notes": notes} if notes else None,
             )
 
-            # -----------------------------------------------------
-            # 4b. Static checks on implementation only
-            # -----------------------------------------------------
+            # Run static checks on implementation files.
             stage = "static_checks"
             stage_started = time.perf_counter()
 
@@ -621,8 +591,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 if attempt < max_attempts:
                     continue
 
-                # Retry limit reached. Do not invoke the reviewer
-                # for an implementation that failed static checks.
+                # Do not review code that failed static checks.
                 break
 
             yield log_event(
@@ -630,15 +599,11 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 "Static checks passed",
             )
 
-            # -----------------------------------------------------
-            # 4c. Reviewer evaluates accepted-plan criteria and code
-            # -----------------------------------------------------
+            # Review implementation against the plan.
             stage = "reviewer"
             stage_started = time.perf_counter()
 
             try:
-                # `files` contains no README.md, so the reviewer
-                # evaluates the implementation independently.
                 review = agents.review(
                     llm,
                     plan,
@@ -667,8 +632,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
 
             reviewer_approved = review.get("approved") is True
 
-            # Approval requires an explicit approval and no
-            # outstanding code findings.
             if reviewer_approved and not code_issues:
                 approved = True
                 issues = []
@@ -683,7 +646,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 )
                 break
 
-            # Reviewer rejected the implementation.
             feedback_code = code_issues
 
             if not feedback_code:
@@ -723,12 +685,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 {"open_issues": issues},
             )
 
-        # =========================================================
-        # 5. DOCUMENTATION PHASE
-        #
-        # Runs only after implementation approval.
-        # README revisions never rerun the coder or reviewer.
-        # =========================================================
+        # Generate and validate documentation after implementation approval.
         if approved:
             accepted_files = {
                 path: content
@@ -736,8 +693,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 if not is_readme(path)
             }
 
-            # Preserve the accepted source/test snapshot. All
-            # documentation attempts read from this same snapshot.
+            # Keep all documentation attempts based on the approved snapshot.
             delivery_files = dict(accepted_files)
 
             docs_max_attempts = settings.max_retries + 1
@@ -745,8 +701,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             docs_approved = False
             docs_issues: list[str] = []
 
-            # Fail explicitly if documentation checks are not
-            # configured. Do not silently mark unchecked docs valid.
             documentation_checks = getattr(
                 agents,
                 "documentation_checks",
@@ -759,9 +713,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     "agents.documentation_checks is unavailable."
                 )
 
-            # Generate deterministic commands from the accepted code.
-            # Pass them through the plan context so the documentarian
-            # can use them rather than inventing commands.
+            # Give the Documentarian the commands detected from accepted files.
             documentation_plan = dict(plan)
             documentation_plan["deterministic_commands"] = (
                 get_deterministic_commands(accepted_files)
@@ -778,9 +730,6 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     {"feedback": feedback_docs} if feedback_docs else None,
                 )
 
-                # -------------------------------------------------
-                # 5a. Documentarian
-                # -------------------------------------------------
                 stage_started = time.perf_counter()
 
                 try:
@@ -821,9 +770,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     "README.md": readme,
                 }
 
-                # -------------------------------------------------
-                # 5b. Documentation checks
-                # -------------------------------------------------
+                # Validate the README without changing accepted source files.
                 stage = "documentation_checks"
                 stage_started = time.perf_counter()
 
@@ -853,8 +800,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     )
                     break
 
-                # Only documentation feedback is updated here.
-                # Accepted implementation files are never changed.
+                # Retry documentation without changing accepted implementation files.
                 feedback_docs = docs_issues
 
                 yield log_event(
@@ -871,8 +817,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                 status = "approved"
                 issues = []
             else:
-                # Keep the last generated README for inspection, but
-                # explicitly identify it as unvalidated.
+                # Preserve the last README and mark the delivery as unvalidated.
                 status = "documentation_failed"
                 issues = docs_issues
 
@@ -890,9 +835,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     {"open_issues": docs_issues},
                 )
 
-        # ---------------------------------------------------------
-        # 6. Final session state and response
-        # ---------------------------------------------------------
+        # Save the delivery and build the final response.
         session.plan = plan
         session.files = dict(files)
 
@@ -925,9 +868,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             issues=issues,
         )
 
-        # Do not conflate documentation failure with implementation
-        # rejection. The reviewer approved the implementation; the
-        # README simply did not pass its own validation.
+        # Keep documentation failure separate from implementation rejection.
         if status == "documentation_failed":
             warning = (
                 "DOCUMENTATION VALIDATION FAILED: The implementation "

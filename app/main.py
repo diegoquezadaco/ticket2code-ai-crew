@@ -26,12 +26,15 @@ app = FastAPI(title="Ticket to Code: multi-agent pipeline")
 
 
 class ChatIn(BaseModel):
+    """Validated chat request payload."""
+
     session_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     message: str = Field(min_length=1, max_length=4000)
 
 
 @app.get("/health")
 def health():
+    """Report application and primary-provider configuration status."""
     return {"ok": True, "llm_configured": llm.configured, "max_retries": settings.max_retries}
 
 
@@ -57,7 +60,7 @@ def chat(body: ChatIn):
 
 @app.get("/api/sessions/{session_id}/trace")
 def trace(session_id: str):
-    """Full agent trace of every turn in a conversation (also shown live in the UI)."""
+    """Return trace entries recorded for a session."""
     session = store.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Unknown session")
@@ -105,4 +108,5 @@ def download_project(session_id: str):
 
 @app.get("/")
 def index():
+    """Serve the browser-based chat interface."""
     return FileResponse(STATIC / "index.html")

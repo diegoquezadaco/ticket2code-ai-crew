@@ -260,7 +260,7 @@ function renderReply(parent, text) {
         i++;
       }
 
-      // Quita la indentación común de bloques anidados en listas Markdown.
+      // Remove common indentation from code blocks nested in Markdown lists.
       const indents = codeLines
         .filter(line => line.trim())
         .map(line => line.match(/^\s*/)[0].length);

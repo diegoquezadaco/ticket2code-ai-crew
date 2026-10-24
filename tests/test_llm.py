@@ -1,3 +1,5 @@
+"""Tests for LLM requests, error handling, and provider logging."""
+
 from types import SimpleNamespace
 
 import pytest

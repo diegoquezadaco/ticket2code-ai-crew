@@ -1,4 +1,4 @@
-"""Settings read from environment variables. No secrets live in the repo."""
+"""Load application and provider settings from environment variables."""
 from __future__ import annotations
 
 import os
@@ -26,6 +26,8 @@ def _float(name: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class Settings:
+    """Runtime settings shared by the API, pipeline, and LLM client."""
+
     api_key: str
     base_url: str
     model: str
@@ -36,7 +38,7 @@ class Settings:
     fallback_api_key: str
     fallback_base_url: str
     fallback_model: str
-    max_retries: int  # Coder retries after the first attempt
+    max_retries: int
     llm_timeout: float
     max_sessions: int
     groq_tpm_budget: int = 5900
@@ -45,6 +47,7 @@ class Settings:
     fallback_timeout: float = 380.0
 
     def model_for(self, role: str) -> str:
+        """Return a role-specific model or the configured default model."""
         per_role = {
             "planner": self.planner_model,
             "coder": self.coder_model,
@@ -52,6 +55,7 @@ class Settings:
             "documentarian": self.documentarian_model,
         }
         return per_role.get(role) or self.model
+
     def groq_tpm_budget_for(self, model: str) -> int:
         """
         Return the configured rolling token budget for a specific Groq model.
@@ -65,6 +69,7 @@ class Settings:
 
 
 def get_settings() -> Settings:
+    """Build settings from the current process environment."""
     return Settings(
         api_key=os.getenv("LLM_API_KEY", ""),
         base_url=os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1"),

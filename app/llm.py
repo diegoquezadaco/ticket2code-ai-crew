@@ -29,10 +29,7 @@ class LLMError(Exception):
     """A provider or response error that the pipeline can report cleanly."""
 
 
-# ---------------------------------------------------------------------------
-# Shared Groq rate-limit state
-# Shared by all LLMClient instances within this Python process.
-# ---------------------------------------------------------------------------
+# Shared Groq rate-limit state for this process.
 
 _GROQ_LOCK = threading.RLock()
 _GROQ_CONDITION = threading.Condition(_GROQ_LOCK)
@@ -45,10 +42,6 @@ _GROQ_SEMAPHORES: dict[str, threading.BoundedSemaphore] = {}
 _WINDOW_SECONDS = 60.0
 
 
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
 
 def parse_json(text: str) -> dict:
     """Parse a JSON object, tolerating Markdown fences or surrounding prose."""
@@ -173,8 +166,7 @@ def _estimate_tokens(system: str, user: str, max_tokens: int) -> int:
     prompt_chars = len(system or "") + len(user or "")
     estimated_input = max(1, (prompt_chars + 3) // 4)
 
-    # Reserve part of the requested completion allowance.
-    # Increase this fraction if your models typically generate long responses.
+    # Reserve half the requested completion allowance, with a minimum of 128.
     estimated_output = max(128, int(max_tokens * 0.50))
 
     return estimated_input + estimated_output
@@ -331,11 +323,9 @@ def _groq_semaphore_for(model_key: str) -> threading.BoundedSemaphore:
         return semaphore
 
 
-# ---------------------------------------------------------------------------
-# LLM client
-# ---------------------------------------------------------------------------
-
 class LLMClient:
+    """Call configured OpenAI-compatible providers with bounded retries."""
+
     def __init__(self, settings: Settings):
         self.s = settings
 
@@ -389,10 +379,6 @@ class LLMClient:
     def configured(self) -> bool:
         """Whether the primary provider is configured."""
         return self._primary is not None
-
-    # -----------------------------------------------------------------------
-    # Public text interface
-    # -----------------------------------------------------------------------
 
     def chat_text(
         self,
@@ -475,10 +461,6 @@ class LLMClient:
         raise LLMError(
             "All configured LLM providers failed. " + " | ".join(errors)
         )
-
-    # -----------------------------------------------------------------------
-    # Internal request implementation
-    # -----------------------------------------------------------------------
 
     def _call(
         self,
@@ -588,14 +570,6 @@ class LLMClient:
                         prompt_chars,
                         kwargs.get("max_tokens"),
                     )
-                    # log.info(
-                    #     "Ollama response: model=%s finish_reason=%s "
-                    #     "prompt_tokens=%s completion_tokens=%s",
-                    #     model,
-                    #     response.choices[0].finish_reason,
-                    #     getattr(response.usage, "prompt_tokens", None),
-                    #     getattr(response.usage, "completion_tokens", None),
-                    # )
 
                 request_started = time.perf_counter()
 
@@ -815,10 +789,6 @@ class LLMClient:
         raise LLMError(
             f"{last_error} after {max_attempts} attempts"
         )
-
-    # -----------------------------------------------------------------------
-    # Public JSON interface
-    # -----------------------------------------------------------------------
 
     def chat_json(
         self,
