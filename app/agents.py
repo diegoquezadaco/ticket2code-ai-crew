@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import difflib
 
 from .llm import LLMClient, LLMError
 
@@ -34,13 +35,17 @@ PLANNER_SYS = (
 )
 
 CODER_SYS = (
-    "Implement the plan completely. Output each file as `### FILE: path` followed by one fenced "
-    "code block containing the full file. Output nothing else except optional `NOTES: ...`. "
-    "Implement only what the plan requires.Preserve existing behavior outside the requested change."
-    "Add tests that meaningfully cover the acceptance criteria without duplicating tests."
-    "Do not add extra features, abstractions, or files unless necessary."
-    "Keep notes concise."
-    "Never modify files that do not need changes."
+    "Implement the plan completely. Preserve existing behavior outside "
+    "the requested change. Add tests that meaningfully cover the "
+    "acceptance criteria without duplicating tests. Do not add extra "
+    "features, abstractions, or files unless necessary. "
+    "Keep notes concise. Never modify files that do not need changes. "
+    "When asked for SEARCH/REPLACE edit blocks, output only those blocks "
+    "in the exact requested format, containing only the necessary "
+    "changes. Do not output complete files in edit-block mode. "
+    "Otherwise, output each complete file as `### FILE: path` followed "
+    "by one fenced code block containing the full file. Output nothing "
+    "else except optional `NOTES: ...`."
 )
 
 REVIEWER_SYS = (
@@ -184,6 +189,69 @@ def parse_files(text: str) -> dict:
         files[path] = content.rstrip() + "\n"
     return files
 
+_EDIT_BLOCK_RE = re.compile(
+    r"(?ms)^### EDIT:[ \t]*(?P<path>[^\n]+)\n"
+    r"<<<<<<< SEARCH\n"
+    r"(?P<search>.*?)\n=======\n"
+    r"(?P<replace>.*?)\n>>>>>>> REPLACE"
+)
+
+
+def apply_edit_blocks(
+    text: str,
+    files: dict,
+) -> tuple[dict | None, list[str], str | None]:
+    """
+    Apply exact SEARCH/REPLACE blocks to existing files.
+
+    Returns:
+        updated files, changed paths, error message
+
+    If any edit is invalid, no partial result is returned.
+    """
+    matches = list(_EDIT_BLOCK_RE.finditer(text or ""))
+
+    if not matches:
+        return None, [], "No valid SEARCH/REPLACE edit blocks were returned."
+
+    updated = dict(files)
+    changed_paths = []
+
+    for match in matches:
+        path = match.group("path").strip().replace("\\", "/")
+        search_text = match.group("search")
+        replacement_text = match.group("replace")
+
+        if (
+            not path
+            or path.startswith("/")
+            or ".." in path.split("/")
+            or path not in updated
+        ):
+            return None, [], f"Invalid or unknown edit path: {path!r}"
+
+        if not search_text:
+            return None, [], f"Empty SEARCH block for {path}."
+
+        occurrences = updated[path].count(search_text)
+
+        if occurrences != 1:
+            return (
+                None,
+                [],
+                f"SEARCH block for {path} matched {occurrences} times; "
+                "exactly one match is required.",
+            )
+
+        updated[path] = updated[path].replace(
+            search_text,
+            replacement_text,
+            1,
+        )
+
+        changed_paths.append(path)
+
+    return updated, sorted(set(changed_paths)), None
 
 def generate_file_tree(files: dict) -> str:
     """Genera una representación visual tipo árbol de archivos de manera determinista."""
@@ -337,67 +405,261 @@ def make_plan(llm: LLMClient, request: str, lang: str, prior_plan, files: dict, 
     return plan
 
 
-def write_code(llm: LLMClient, plan: dict, files: dict, feedback, attempt: int):
-    user = f"Plan:\n{json.dumps(plan, ensure_ascii=False)}\n\nCurrent files:\n{render_files(files, 12000)}"
-    if feedback:
-        user += f"\n\nReviewer feedback to fix (attempt {attempt}):\n{feedback}"
-    for _ in range(2):
-        text = llm.chat_text("coder", CODER_SYS, user, max_tokens=3500, temperature=0.2)
-        new_files = parse_files(text)
-        new_files = parse_files(text)
+def write_code(
+    llm: LLMClient,
+    plan: dict,
+    files: dict,
+    feedback,
+    attempt: int,
+):
+    import logging
 
-    if new_files:
-        import logging
+    logger = logging.getLogger(__name__)
 
-        logger = logging.getLogger(__name__)
+    compact_plan = {
+        "title": plan.get("title", ""),
+        "tasks": [
+            task.get("title", "")
+            if isinstance(task, dict)
+            else str(task)
+            for task in plan.get("tasks", [])
+        ],
+        "acceptance_criteria": plan.get("acceptance_criteria", []),
+    }
 
-        logger.info(
-            "Coder parsed %d file(s): %s",
-            len(new_files),
-            {
-                path: {
-                    "characters": len(content),
-                    "lines": len(content.splitlines()),
-                    "ends_with_newline": content.endswith("\n"),
-                }
-                for path, content in new_files.items()
-            },
+    plan_context = json.dumps(
+        compact_plan if attempt >= 2 else plan,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    feedback_text = (
+        "\n\nReviewer or static-check feedback to fix:\n"
+        + "\n".join(feedback)
+        if feedback
+        else ""
+    )
+
+    # ---------------------------------------------------------
+    # Retry attempts: ask for SEARCH / REPLACE edit blocks.
+    # ---------------------------------------------------------
+    if attempt >= 2 and files:
+        edit_user = (
+            f"Plan:\n{plan_context}\n\n"
+            f"Current files:\n{render_files(files, 12000)}"
+            f"{feedback_text}\n\n"
+            "Modify the existing files to address the feedback. "
+            "Return ONLY SEARCH/REPLACE edit blocks; do not return "
+            "complete files or Markdown code fences.\n\n"
+            "Use this exact format for each edit:\n"
+            "### EDIT: path/to/file\n"
+            "<<<<<<< SEARCH\n"
+            "exact existing lines to find\n"
+            "=======\n"
+            "replacement lines\n"
+            ">>>>>>> REPLACE\n\n"
+            "Rules:\n"
+            "- SEARCH must match the existing file text exactly.\n"
+            "- Keep SEARCH blocks as small as possible.\n"
+            "- Include enough surrounding lines to make each match unique.\n"
+            "- Change only what is necessary to fix the reported issues.\n"
+            "- Do not output a block for an unchanged file.\n"
+            "- Do not invent files or existing code.\n"
+            "- If no edit is necessary, explain this in a concise NOTES line."
         )
 
-        notes = re.search(r"^NOTES:\s*(.+)$", text, re.M)
+        edit_text = llm.chat_text(
+            "coder",
+            CODER_SYS,
+            edit_user,
+            max_tokens=1200,
+            temperature=0.2,
+        )
 
-        return new_files, (notes.group(1).strip() if notes else "")
+        updated_files, changed_paths, edit_error = apply_edit_blocks(
+            edit_text,
+            files,
+        )
+
+        if updated_files is not None:
+            new_files = {
+                path: updated_files[path]
+                for path in changed_paths
+            }
+
+            if new_files:
+                logger.info(
+                    "Coder applied edits to %d file(s): %s",
+                    len(new_files),
+                    changed_paths,
+                )
+
+                notes = re.search(
+                    r"^NOTES:\s*(.+)$",
+                    edit_text,
+                    re.M,
+                )
+
+                return (
+                    new_files,
+                    notes.group(1).strip() if notes else "",
+                )
+
+            edit_error = (
+                "The edit response contained no applicable file changes."
+            )
+
+        logger.warning(
+            "Coder edit application failed; falling back to a full rewrite: %s",
+            edit_error,
+        )
+
+    # ---------------------------------------------------------
+    # First attempt, or fallback when edits cannot be applied:
+    # request complete files.
+    # ---------------------------------------------------------
+    user = (
+        f"Plan:\n{plan_context}\n\n"
+        f"Current files:\n{render_files(files, 12000)}"
+        f"{feedback_text}\n\n"
+        "Output each complete file as `### FILE: path` followed by "
+        "one fenced code block containing the full file. "
+        "Output nothing else except optional `NOTES: ...`."
+    )
+
+    for format_attempt in range(2):
+        text = llm.chat_text(
+            "coder",
+            CODER_SYS,
+            user,
+            max_tokens=2800,
+            temperature=0.2,
+        )
+
+        new_files = parse_files(text)
+
+        if new_files:
+            logger.info(
+                "Coder parsed %d file(s): %s",
+                len(new_files),
+                {
+                    path: {
+                        "characters": len(content),
+                        "lines": len(content.splitlines()),
+                        "ends_with_newline": content.endswith("\n"),
+                    }
+                    for path, content in new_files.items()
+                },
+            )
+
+            notes = re.search(r"^NOTES:\s*(.+)$", text, re.M)
+
+            return (
+                new_files,
+                notes.group(1).strip() if notes else "",
+            )
+
+        if format_attempt == 0:
+            user += (
+                "\n\nYour previous response did not follow the required "
+                "`### FILE:` format. Return the complete files again "
+                "using that exact format."
+            )
+
     raise LLMError("the Coder returned no parseable files")
 
-
-def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
+def review(
+    llm: LLMClient,
+    plan: dict,
+    files: dict,
+    lang: str,
+    attempt: int = 1,
+    previous_files: dict | None = None,
+    previous_issues: list[str] | None = None,
+) -> dict:
     review_files = {
         path: content
         for path, content in files.items()
         if path.rsplit("/", 1)[-1].lower() != "readme.md"
     }
 
+    # Keep only task titles and acceptance criteria.
+    # Task details and assumptions are unnecessary for this review.
     compact_plan = {
         "title": plan.get("title", ""),
-        "tasks": plan.get("tasks", []),
+        "tasks": [
+            task.get("title", "")
+            if isinstance(task, dict)
+            else str(task)
+            for task in plan.get("tasks", [])
+        ],
         "acceptance_criteria": plan.get("acceptance_criteria", []),
-        "assumptions": plan.get("assumptions", []),
     }
+
+    plan_json = json.dumps(
+        compact_plan,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    if attempt >= 2 and previous_files is not None:
+        # Build a unified diff rather than resending complete files.
+        diff_parts = []
+
+        for path in sorted(set(previous_files) | set(review_files)):
+            old_content = previous_files.get(path)
+            new_content = review_files.get(path)
+
+            if old_content == new_content:
+                continue
+
+            diff_parts.extend(
+                difflib.unified_diff(
+                    (old_content or "").splitlines(keepends=True),
+                    (new_content or "").splitlines(keepends=True),
+                    fromfile=f"a/{path}" if old_content is not None else "/dev/null",
+                    tofile=f"b/{path}" if new_content is not None else "/dev/null",
+                )
+            )
+
+        diff_text = "".join(diff_parts) or "(No source changes detected.)"
+
+        previous_issues_json = json.dumps(
+            previous_issues or [],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        implementation_context = (
+            "Review attempt: "
+            f"{attempt}\n\n"
+            "Previous issues that must be verified as fixed:\n"
+            f"{previous_issues_json}\n\n"
+            "Changes since the previous attempt:\n"
+            f"{diff_text}"
+        )
+
+    else:
+        implementation_context = (
+            "Automated syntax checks: passed.\n\n"
+            "Inspect the actual source files and tests provided below.\n\n"
+            f"Files:\n{render_files(review_files, 9000)}"
+        )
 
     user = (
         f"Language for text fields: {LANG_NAMES[lang]}\n\n"
-        f"Plan and acceptance criteria:\n"
-        f"{json.dumps(compact_plan, ensure_ascii=False)}\n\n"
-        "Automated syntax checks: passed.\n\n"
+        "Task titles and acceptance criteria:\n"
+        f"{plan_json}\n\n"
+        f"{implementation_context}\n\n"
         "Review the implementation against the acceptance criteria. "
-        "Inspect the actual source files and tests provided below. "
-        "Do not report a file as missing if it is present. "
-        "Do not invent requirements. If the provided context is "
-        "insufficient to verify a criterion, identify that limitation "
-        "rather than claiming the implementation is defective. "
+        "On retry attempts, focus on whether the previous issues are fixed "
+        "and whether the supplied changes introduce new issues. "
+        "Do not report a file as missing if it is present in the supplied "
+        "context. Do not invent requirements. If the supplied context is "
+        "insufficient to verify a criterion, state that limitation "
+        "concisely. Do not reproduce source code. "
         "Return only actionable implementation issues and a concise "
-        "approval decision.\n\n"
-        f"Files:\n{render_files(review_files, 9000)}"
+        "approval decision."
     )
 
     r = llm.chat_json(
@@ -405,7 +667,7 @@ def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
         REVIEWER_SYS,
         user,
         required=("approved",),
-        max_tokens=1000,
+        max_tokens=500,
     )
 
     def clean_issues(key: str) -> list[str]:
@@ -421,8 +683,6 @@ def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
 
         for item in value:
             if isinstance(item, dict):
-                # Extract useful details instead of passing a raw dict
-                # representation to the Coder.
                 fields = (
                     "file",
                     "line",
@@ -454,6 +714,7 @@ def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
 
     # Compatibility with older Reviewer response formats.
     legacy_issues = clean_issues("issues")
+
     if legacy_issues and not code_issues and not documentation_issues:
         code_issues = legacy_issues
 

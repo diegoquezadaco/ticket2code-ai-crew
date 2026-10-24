@@ -500,12 +500,16 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             # 4a. Coder
             # -----------------------------------------------------
             stage = "coder"
+            # Snapshot the implementation and issues before this attempt changes anything.
+            previous_files = dict(files)
+            previous_issues = list(feedback_code)
 
             coder_files = {
                 path: content
                 for path, content in files.items()
                 if not is_readme(path)
             }
+            
 
             coder_feedback = "\n".join(feedback_code) or None
             note = (
@@ -640,6 +644,9 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
                     plan,
                     files,
                     lang,
+                    attempt=attempt,
+                    previous_files=previous_files,
+                    previous_issues=previous_issues,
                 )
             finally:
                 log.info(

@@ -38,12 +38,12 @@ _GROQ_LOCK = threading.RLock()
 _GROQ_CONDITION = threading.Condition(_GROQ_LOCK)
 
 # Each entry is [monotonic timestamp, reserved token count].
-_GROQ_USAGE: deque[list[float]] = deque()
-
-_GROQ_COOLDOWN_UNTIL = 0.0
-_GROQ_SEMAPHORE = threading.BoundedSemaphore(1)
+_GROQ_USAGE: dict[str, deque[list[float]]] = {}
+_GROQ_COOLDOWN_UNTIL: dict[str, float] = {}
+_GROQ_SEMAPHORES: dict[str, threading.BoundedSemaphore] = {}
 
 _WINDOW_SECONDS = 60.0
+
 
 
 # ---------------------------------------------------------------------------
@@ -180,53 +180,56 @@ def _estimate_tokens(system: str, user: str, max_tokens: int) -> int:
     return estimated_input + estimated_output
 
 
-def _trim_groq_usage_locked(now: float) -> None:
+def _trim_groq_usage_locked(
+    now: float,
+    usage: deque[list[float]],
+) -> None:
     """Remove reservations older than the rolling 60-second window."""
     cutoff = now - _WINDOW_SECONDS
 
-    while _GROQ_USAGE and _GROQ_USAGE[0][0] <= cutoff:
-        _GROQ_USAGE.popleft()
+    while usage and usage[0][0] <= cutoff:
+        usage.popleft()
 
 
-def _groq_set_cooldown(seconds: float) -> None:
-    """Apply a shared cooldown after a Groq rate-limit response."""
-    global _GROQ_COOLDOWN_UNTIL
-
-    seconds = max(1.0, min(float(seconds), 300.0))
+def _groq_set_cooldown(model_key: str, seconds: float) -> None:
+    """Apply a cooldown to one Groq model without blocking other models."""
+    seconds = max(60.0, min(float(seconds), 300.0))
 
     with _GROQ_CONDITION:
-        _GROQ_COOLDOWN_UNTIL = max(
-            _GROQ_COOLDOWN_UNTIL,
+        _GROQ_COOLDOWN_UNTIL[model_key] = max(
+            _GROQ_COOLDOWN_UNTIL.get(model_key, 0.0),
             time.monotonic() + seconds,
         )
         _GROQ_CONDITION.notify_all()
 
     log.warning(
-        "Groq cooldown activated for approximately %.1f seconds",
+        "Groq cooldown activated: model=%s duration_seconds=%.1f",
+        model_key,
         seconds,
     )
 
 
 def _groq_reserve(
+    model_key: str,
     estimated_tokens: int,
     budget: int,
     max_wait_seconds: float,
 ) -> float:
     """
-    Reserve estimated tokens in the shared rolling window.
+    Reserve estimated tokens in one model's rolling 60-second window.
 
-    Raises LLMError instead of sending a request if the budget cannot
-    accommodate it within the configured waiting period.
-
-    Returns the reservation timestamp.
+    Wait for capacity to become available before reporting temporary
+    budget exhaustion. Returns the reservation timestamp.
     """
     if budget <= 0:
-        raise LLMError("GROQ_TPM_BUDGET must be greater than zero.")
+        raise LLMError("Groq TPM budget must be greater than zero.")
 
     if estimated_tokens > budget:
         raise LLMError(
-            "Estimated request size exceeds the configured Groq TPM budget "
-            f"({estimated_tokens} > {budget})."
+            f"Estimated request size exceeds the configured Groq TPM "
+            f"budget for {model_key} "
+            f"({estimated_tokens} > {budget}). "
+            "Reduce the prompt or max_tokens."
         )
 
     deadline = time.monotonic() + max(0.0, max_wait_seconds)
@@ -235,34 +238,40 @@ def _groq_reserve(
         now = time.monotonic()
 
         with _GROQ_CONDITION:
-            _trim_groq_usage_locked(now)
+            usage = _GROQ_USAGE.setdefault(model_key, deque())
+            _trim_groq_usage_locked(now, usage)
 
-            cooldown_remaining = _GROQ_COOLDOWN_UNTIL - now
+            cooldown_remaining = (
+                _GROQ_COOLDOWN_UNTIL.get(model_key, 0.0) - now
+            )
+
+            wait_remaining = deadline - now
 
             if cooldown_remaining > 0:
-                wait_remaining = deadline - now
-
-                if wait_remaining <= 0 or cooldown_remaining > wait_remaining:
+                if wait_remaining <= 0:
                     raise LLMError(
-                        "Groq is in cooldown for approximately "
-                        f"{cooldown_remaining:.1f} more seconds."
+                        f"Groq cooldown remains active for {model_key}; "
+                        f"approximately {cooldown_remaining:.1f} seconds remain."
                     )
 
                 _GROQ_CONDITION.wait(
-                    timeout=min(cooldown_remaining, wait_remaining, 1.0)
+                    timeout=min(
+                        cooldown_remaining,
+                        wait_remaining,
+                        1.0,
+                    )
                 )
                 continue
 
-            used_tokens = sum(
-                int(entry[1]) for entry in _GROQ_USAGE
-            )
+            used_tokens = sum(int(entry[1]) for entry in usage)
 
             if used_tokens + estimated_tokens <= budget:
-                _GROQ_USAGE.append([now, float(estimated_tokens)])
+                usage.append([now, float(estimated_tokens)])
 
                 log.debug(
-                    "Groq TPM reservation: estimated=%d, reserved=%d, "
-                    "budget=%d",
+                    "Groq TPM reservation: model=%s estimated=%d "
+                    "reserved=%d budget=%d",
+                    model_key,
                     estimated_tokens,
                     used_tokens + estimated_tokens,
                     budget,
@@ -270,20 +279,15 @@ def _groq_reserve(
 
                 return now
 
-            wait_remaining = deadline - now
-
             if wait_remaining <= 0:
                 raise LLMError(
-                    "Groq TPM budget temporarily exhausted: "
-                    f"estimated used={used_tokens}, "
-                    f"requested={estimated_tokens}, budget={budget}."
+                    "Groq TPM budget temporarily exhausted for "
+                    f"{model_key}: estimated used={used_tokens}, "
+                    f"requested={estimated_tokens}, budget={budget}, "
+                    f"waited up to {max_wait_seconds:.1f} seconds."
                 )
 
-            oldest_timestamp = (
-                _GROQ_USAGE[0][0]
-                if _GROQ_USAGE
-                else now
-            )
+            oldest_timestamp = usage[0][0] if usage else now
 
             until_window_frees = max(
                 0.05,
@@ -291,27 +295,40 @@ def _groq_reserve(
             )
 
             _GROQ_CONDITION.wait(
-                timeout=min(until_window_frees, wait_remaining, 1.0)
+                timeout=min(
+                    until_window_frees,
+                    wait_remaining,
+                    1.0,
+                )
             )
 
 
 def _groq_adjust_reservation(
+    model_key: str,
     reservation_timestamp: float,
     actual_tokens: int,
 ) -> None:
-    """
-    Replace a successful request's estimate with actual usage when available.
-
-    The request is serialized by the Groq semaphore, so its reservation
-    remains identifiable while the request is in progress.
-    """
+    """Replace a model's estimated reservation with actual usage."""
     with _GROQ_CONDITION:
-        for entry in _GROQ_USAGE:
+        usage = _GROQ_USAGE.get(model_key, deque())
+
+        for entry in usage:
             if entry[0] == reservation_timestamp:
                 entry[1] = float(max(0, actual_tokens))
                 break
 
         _GROQ_CONDITION.notify_all()
+
+def _groq_semaphore_for(model_key: str) -> threading.BoundedSemaphore:
+    """Return a request semaphore dedicated to one Groq model."""
+    with _GROQ_LOCK:
+        semaphore = _GROQ_SEMAPHORES.get(model_key)
+
+        if semaphore is None:
+            semaphore = threading.BoundedSemaphore(1)
+            _GROQ_SEMAPHORES[model_key] = semaphore
+
+        return semaphore
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +507,23 @@ class LLMClient:
         # Let the local fallback generate without an application-level output cap.
         if provider_name != "fallback":
             kwargs["max_tokens"] = max_tokens
+        # Reduce reasoning-token consumption for supported Groq models.
+        if is_groq:
+            if model.startswith("openai/gpt-oss-"):
+                kwargs["extra_body"] = {
+                    "reasoning_effort": "low",
+                }
+
+            elif model == "qwen/qwen3.8-27b":
+                effort = (
+                    "none"
+                    if role in {"reviewer", "documentarian", "router"}
+                    else "low"
+                )
+
+                kwargs["extra_body"] = {
+                    "reasoning_effort": effort,
+                }
 
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -502,6 +536,7 @@ class LLMClient:
 
         for attempt in range(max_attempts):
             reservation_timestamp: float | None = None
+            groq_semaphore = _groq_semaphore_for(model) if is_groq else None
             semaphore_acquired = False
 
             try:
@@ -511,7 +546,7 @@ class LLMClient:
                         getattr(self.s, "groq_wait_seconds", 5)
                     )
 
-                    semaphore_acquired = _GROQ_SEMAPHORE.acquire(
+                    semaphore_acquired = groq_semaphore.acquire(
                         timeout=max(0.0, wait_seconds)
                     )
 
@@ -520,9 +555,12 @@ class LLMClient:
                             "Timed out waiting for the shared Groq request slot."
                         )
 
-                    budget = int(
-                        getattr(self.s, "groq_tpm_budget", 4500)
-                    )
+                    budget_getter = getattr(self.s, "groq_tpm_budget_for", None)
+
+                    if callable(budget_getter):
+                        budget = int(budget_getter(model))
+                    else:
+                        budget = int(getattr(self.s, "groq_tpm_budget", 4500))
 
                     estimated_tokens = _estimate_tokens(
                         system=system,
@@ -531,6 +569,7 @@ class LLMClient:
                     )
 
                     reservation_timestamp = _groq_reserve(
+                        model_key=model,
                         estimated_tokens=estimated_tokens,
                         budget=budget,
                         max_wait_seconds=wait_seconds,
@@ -649,6 +688,7 @@ class LLMClient:
 
                         if actual_tokens is not None:
                             _groq_adjust_reservation(
+                                model,
                                 reservation_timestamp,
                                 int(actual_tokens),
                             )
@@ -673,7 +713,7 @@ class LLMClient:
                         default=default_cooldown,
                     )
 
-                    _groq_set_cooldown(cooldown)
+                    _groq_set_cooldown(model,cooldown)
 
                 raise LLMError(
                     f"HTTP 429 rate limit reached: {detail}"
@@ -764,8 +804,8 @@ class LLMClient:
                 ) from e
 
             finally:
-                if semaphore_acquired:
-                    _GROQ_SEMAPHORE.release()
+                if semaphore_acquired and groq_semaphore is not None:
+                    groq_semaphore.release()
 
             # Backoff only for retryable errors; never wait after the last try.
             if attempt < max_attempts - 1:

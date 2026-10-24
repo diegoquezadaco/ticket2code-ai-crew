@@ -57,7 +57,10 @@ def test_request_completion_log_includes_provider_and_role(caplog):
     caplog.set_level("INFO")
     response = SimpleNamespace(
         usage=None,
-        choices=[SimpleNamespace(message=SimpleNamespace(content="done"))],
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="done"),
+        )],
     )
     llm, client = make_client(response=response)
 
