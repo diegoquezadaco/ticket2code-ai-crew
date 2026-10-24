@@ -35,26 +35,39 @@ PLANNER_SYS = (
 CODER_SYS = (
     "Implement the plan completely. Output each file as `### FILE: path` followed by one fenced "
     "code block containing the full file. Output nothing else except optional `NOTES: ...`. "
-    "For Python, use only the standard library unless specified and include unittest coverage "
-    "for every acceptance criterion. When existing files or review feedback are provided, output "
-    "the full contents of every changed file; omitted files remain unchanged. Never modify README.md."
+    "Implement only what the plan requires.Preserve existing behavior outside the requested change."
+    "Add tests that meaningfully cover the acceptance criteria without duplicating tests."
+    "Do not add extra features, abstractions, or files unless necessary."
+    "Keep notes concise."
+    "Never modify files that do not need changes."
 )
 
 REVIEWER_SYS = (
-    "Review delivered files against the plan and acceptance criteria. Report blocking issues only, "
-    "classifying each as code_issues (implementation/executable tests) or documentation_issues "
-    "(README, usage, examples, written test explanations). Approve only if both lists are empty. "
-    "Write feedback in the requested language. "
-    'Return ONLY JSON: {"approved":bool,"code_issues":[str],'
-    '"documentation_issues":[str],"feedback":"actionable instructions"}'
+    "You are a senior software engineer reviewing an implementation."
+    "Review the supplied implementation against the plan and acceptance criteria."
+
+    "Return valid JSON only, with these fields:"
+    " - approved: boolean"
+    " - code_issues: array of strings"
+    " - documentation_issues: array of strings"
+    " - feedback: short string"
+
+    "Rules:"
+    " - Each issue must identify the relevant file and the concrete correction needed."
+    " - Do not invent requirements."
+    " - Do not reject code because a file is absent from the prompt if its contents are provided elsewhere in the review context."
+    " - Do not claim that tests pass unless their results were actually supplied."
+    " - Do not reproduce source code in your response."
+    " - If there are no implementation issues, return empty issue arrays and approved=true."
+    " - If the supplied context is insufficient to verify an acceptance criterion, state the limitation concisely."
+    " - Keep the entire response compact."
 )
 
 DOCUMENTARIAN_SYS = (
-    "Own README.md only. Never modify source code or tests. Use only the plan, supplied files, "
-    "deterministic file tree, and commands. Never invent features, dependencies, commands, or test "
-    "results. Document requirements, structure, setup, available run/test commands, usage, and "
-    "existing test cases. State when commands are unavailable. Apply documentation feedback and "
-    "write in the requested language. Output the complete README between these markers:\n"
+    "Own README.md only. Use the deterministic_commands supplied in the plan as the source"
+    "of truth for setup, installation, testing, and run instructions."
+    "Do not invent or modify commands. Document only files and functionality present in the accepted implementation."
+    "Do not modify source files or tests. Output the complete README between these markers:\n"
     "### README_CONTENT_START\n"
     "README content\n"
     "### README_CONTENT_END"
@@ -86,15 +99,72 @@ def _history_text(history: list) -> str:
 
 
 def render_files(files: dict, limit: int = 14000) -> str:
-    blocks, used = [], 0
-    for path, content in files.items():
-        block = f"### FILE: {path}\n```\n{content}\n```"
-        if used + len(block) > limit:
-            blocks.append(f"### FILE: {path}\n(omitted, too long)")
-            continue
-        blocks.append(block)
-        used += len(block)
-    return "\n\n".join(blocks) or "(no files)"
+    if not files:
+        return "(no files)"
+
+    items = list(files.items())
+    blocks = []
+
+    # Reserve space for file headers, code fences, and truncation markers.
+    overhead = sum(len(f"### FILE: {path}\n```\n\n```") for path, _ in items)
+    available = max(0, limit - overhead)
+
+    # Initially distribute the remaining budget evenly across files.
+    remaining = {path: str(content) for path, content in items}
+    budgets = {
+        path: available // len(items)
+        for path, _ in items
+    }
+
+    # Redistribute unused budget from short files to longer files.
+    unused = sum(
+        max(0, budgets[path] - len(content))
+        for path, content in remaining.items()
+    )
+
+    while unused > 0:
+        candidates = [
+            path for path, content in remaining.items()
+            if len(content) > budgets[path]
+        ]
+
+        if not candidates:
+            break
+
+        extra_per_file = max(1, unused // len(candidates))
+        distributed = 0
+
+        for path in candidates:
+            extra = min(
+                extra_per_file,
+                len(remaining[path]) - budgets[path],
+                unused - distributed,
+            )
+            budgets[path] += extra
+            distributed += extra
+
+            if distributed >= unused:
+                break
+
+        if distributed == 0:
+            break
+
+        unused -= distributed
+
+    for path, content in items:
+        content = str(content)
+        budget = budgets[path]
+
+        if len(content) > budget:
+            marker = "\n... [content truncated; not the complete file] ..."
+            if budget > len(marker):
+                content = content[:budget - len(marker)] + marker
+            else:
+                content = content[:budget]
+
+        blocks.append(f"### FILE: {path}\n```\n{content}\n```")
+
+    return "\n\n".join(blocks)
 
 
 _FILE_RE = re.compile(r"###\s*FILE:\s*`?([^\n`]+?)`?\s*\n```[^\n]*\n(.*?)\n?```", re.S)
@@ -269,45 +339,131 @@ def write_code(llm: LLMClient, plan: dict, files: dict, feedback, attempt: int):
     for _ in range(2):
         text = llm.chat_text("coder", CODER_SYS, user, max_tokens=3500, temperature=0.2)
         new_files = parse_files(text)
-        if new_files:
-            notes = re.search(r"^NOTES:\s*(.+)$", text, re.M)
-            return new_files, (notes.group(1).strip() if notes else "")
-        user += "\n\nYour previous reply did not follow the required `### FILE:` format. Output the files again in that format."
+        new_files = parse_files(text)
+
+    if new_files:
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        logger.info(
+            "Coder parsed %d file(s): %s",
+            len(new_files),
+            {
+                path: {
+                    "characters": len(content),
+                    "lines": len(content.splitlines()),
+                    "ends_with_newline": content.endswith("\n"),
+                }
+                for path, content in new_files.items()
+            },
+        )
+
+        notes = re.search(r"^NOTES:\s*(.+)$", text, re.M)
+
+        return new_files, (notes.group(1).strip() if notes else "")
     raise LLMError("the Coder returned no parseable files")
 
 
 def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
+    review_files = {
+        path: content
+        for path, content in files.items()
+        if path.rsplit("/", 1)[-1].lower() != "readme.md"
+    }
+
+    compact_plan = {
+        "title": plan.get("title", ""),
+        "tasks": plan.get("tasks", []),
+        "acceptance_criteria": plan.get("acceptance_criteria", []),
+        "assumptions": plan.get("assumptions", []),
+    }
+
     user = (
-        f"Language for text fields: {LANG_NAMES[lang]}\n"
-        f"Plan:\n{json.dumps(plan, ensure_ascii=False)}\n\n"
-        f"Automated syntax checks: passed\n\nFiles:\n{render_files(files, 3500)}"
+        f"Language for text fields: {LANG_NAMES[lang]}\n\n"
+        f"Plan and acceptance criteria:\n"
+        f"{json.dumps(compact_plan, ensure_ascii=False)}\n\n"
+        "Automated syntax checks: passed.\n\n"
+        "Review the implementation against the acceptance criteria. "
+        "Inspect the actual source files and tests provided below. "
+        "Do not report a file as missing if it is present. "
+        "Do not invent requirements. If the provided context is "
+        "insufficient to verify a criterion, identify that limitation "
+        "rather than claiming the implementation is defective. "
+        "Return only actionable implementation issues and a concise "
+        "approval decision.\n\n"
+        f"Files:\n{render_files(review_files, 9000)}"
     )
+
     r = llm.chat_json(
-        "reviewer", REVIEWER_SYS, user,
-        required=("approved",), max_tokens=500,
+        "reviewer",
+        REVIEWER_SYS,
+        user,
+        required=("approved",),
+        max_tokens=1000,
     )
 
     def clean_issues(key: str) -> list[str]:
         value = r.get(key, [])
-        return (
-            [str(item).strip() for item in value if str(item).strip()]
-            if isinstance(value, list)
-            else []
-        )
+
+        if isinstance(value, (str, dict)):
+            value = [value]
+
+        if not isinstance(value, list):
+            return []
+
+        result = []
+
+        for item in value:
+            if isinstance(item, dict):
+                # Extract useful details instead of passing a raw dict
+                # representation to the Coder.
+                fields = (
+                    "file",
+                    "line",
+                    "issue",
+                    "description",
+                    "problem",
+                    "change_needed",
+                    "fix",
+                    "suggestion",
+                )
+
+                parts = [
+                    f"{field}: {item[field]}"
+                    for field in fields
+                    if item.get(field) not in (None, "")
+                ]
+
+                message = "; ".join(parts) if parts else str(item)
+            else:
+                message = str(item).strip()
+
+            if message:
+                result.append(message)
+
+        return result
 
     code_issues = clean_issues("code_issues")
     documentation_issues = clean_issues("documentation_issues")
 
-    # Compatibilidad con respuestas antiguas del Reviewer.
+    # Compatibility with older Reviewer response formats.
     legacy_issues = clean_issues("issues")
     if legacy_issues and not code_issues and not documentation_issues:
         code_issues = legacy_issues
 
+    approved_value = r.get("approved")
     approved = (
-        (r.get("approved") is True or str(r.get("approved")).lower() == "true")
+        approved_value is True
+        or str(approved_value).lower() == "true"
+    )
+
+    approved = (
+        approved
         and not code_issues
         and not documentation_issues
     )
+
     return {
         "approved": approved,
         "code_issues": code_issues,
@@ -315,7 +471,6 @@ def review(llm: LLMClient, plan: dict, files: dict, lang: str) -> dict:
         "issues": code_issues + documentation_issues,
         "feedback": str(r.get("feedback", "")).strip(),
     }
-
 
 def document_project(
     llm: LLMClient,

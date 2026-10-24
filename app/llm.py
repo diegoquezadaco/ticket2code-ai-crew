@@ -1,11 +1,15 @@
-"""Thin wrapper over any OpenAI-compatible API: timeouts, retries, fallback provider, JSON repair."""
+"""OpenAI-compatible LLM client with shared Groq TPM protection and Ollama fallback."""
 from __future__ import annotations
 
 import json
 import logging
-import re
-import time
 import random
+import re
+import threading
+import time
+from collections import deque
+from typing import Any
+from urllib.parse import urlparse
 
 from openai import (
     APIConnectionError,
@@ -22,30 +26,65 @@ log = logging.getLogger(__name__)
 
 
 class LLMError(Exception):
-    """A model call failed in a way the user should be told about."""
+    """A provider or response error that the pipeline can report cleanly."""
 
+
+# ---------------------------------------------------------------------------
+# Shared Groq rate-limit state
+# Shared by all LLMClient instances within this Python process.
+# ---------------------------------------------------------------------------
+
+_GROQ_LOCK = threading.RLock()
+_GROQ_CONDITION = threading.Condition(_GROQ_LOCK)
+
+# Each entry is [monotonic timestamp, reserved token count].
+_GROQ_USAGE: deque[list[float]] = deque()
+
+_GROQ_COOLDOWN_UNTIL = 0.0
+_GROQ_SEMAPHORE = threading.BoundedSemaphore(1)
+
+_WINDOW_SECONDS = 60.0
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 
 def parse_json(text: str) -> dict:
-    """Parse a JSON object from model output, tolerating code fences and extra prose."""
+    """Parse a JSON object, tolerating Markdown fences or surrounding prose."""
     text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\s*```$", "", text).strip()
 
     try:
         obj = json.loads(text)
+
     except json.JSONDecodeError as original_error:
         decoder = json.JSONDecoder()
+        obj = None
 
+        # Recover a JSON object embedded in surrounding text.
         for index, char in enumerate(text):
             if char != "{":
                 continue
 
             try:
-                obj, _ = decoder.raw_decode(text[index:])
-                break
+                candidate, _ = decoder.raw_decode(text[index:])
+
+                if isinstance(candidate, dict):
+                    obj = candidate
+                    break
+
             except json.JSONDecodeError:
                 continue
-        else:
+
+        if obj is None:
             raise ValueError("no valid JSON object found") from original_error
 
     if not isinstance(obj, dict):
@@ -54,40 +93,271 @@ def parse_json(text: str) -> dict:
     return obj
 
 
+def _provider_error(e: Exception, limit: int = 800) -> str:
+    """Return a concise provider error without logging prompts or credentials."""
+    body: Any = getattr(e, "body", None)
+
+    if body:
+        try:
+            detail = json.dumps(
+                body,
+                ensure_ascii=False,
+                default=str,
+            )
+        except Exception:
+            detail = str(body)
+    else:
+        detail = str(getattr(e, "message", e))
+
+    return detail[:limit]
+
+
 def _msg(e: Exception) -> str:
-    return str(getattr(e, "message", e))[:200]
+    """Compatibility helper for concise provider error messages."""
+    return _provider_error(e, limit=800)
 
 
-def _retry_after(e: Exception, attempt: int) -> float:
+def _retry_after_seconds(e: Exception, default: float) -> float:
+    """Read Retry-After or the retry delay reported in the error message."""
     try:
-        wait = float(e.response.headers.get("retry-after", ""))  # type: ignore[attr-defined]
-    except (TypeError, ValueError, AttributeError):
-        wait = 2 ** (attempt + 1)
-    return min(max(wait, 1.0), 20.0)
+        response = getattr(e, "response", None)
 
+        if response is not None:
+            raw = response.headers.get("retry-after", "")
+
+            if raw:
+                return min(max(float(raw), 1.0), 300.0)
+
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    # Some Groq errors include: "Please try again in 20.32s."
+    detail = _provider_error(e)
+
+    match = re.search(
+        r"try again in\s+(\d+(?:\.\d+)?)\s*s",
+        detail,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        try:
+            seconds = float(match.group(1))
+            return min(max(seconds, 1.0), 300.0)
+        except ValueError:
+            pass
+
+    return default
+
+
+def _is_groq_url(url: str | None) -> bool:
+    """Return True when the configured endpoint belongs to Groq."""
+    if not url:
+        return False
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return "groq.com" in url.lower()
+
+    return host == "groq.com" or host.endswith(".groq.com")
+
+
+def _estimate_tokens(system: str, user: str, max_tokens: int) -> int:
+    """
+    Estimate prompt plus completion tokens.
+
+    This is a preventive approximation, not an exact tokenizer.
+    The prompt estimate uses roughly four characters per token.
+    """
+    prompt_chars = len(system or "") + len(user or "")
+    estimated_input = max(1, (prompt_chars + 3) // 4)
+
+    # Reserve part of the requested completion allowance.
+    # Increase this fraction if your models typically generate long responses.
+    estimated_output = max(128, int(max_tokens * 0.50))
+
+    return estimated_input + estimated_output
+
+
+def _trim_groq_usage_locked(now: float) -> None:
+    """Remove reservations older than the rolling 60-second window."""
+    cutoff = now - _WINDOW_SECONDS
+
+    while _GROQ_USAGE and _GROQ_USAGE[0][0] <= cutoff:
+        _GROQ_USAGE.popleft()
+
+
+def _groq_set_cooldown(seconds: float) -> None:
+    """Apply a shared cooldown after a Groq rate-limit response."""
+    global _GROQ_COOLDOWN_UNTIL
+
+    seconds = max(1.0, min(float(seconds), 300.0))
+
+    with _GROQ_CONDITION:
+        _GROQ_COOLDOWN_UNTIL = max(
+            _GROQ_COOLDOWN_UNTIL,
+            time.monotonic() + seconds,
+        )
+        _GROQ_CONDITION.notify_all()
+
+    log.warning(
+        "Groq cooldown activated for approximately %.1f seconds",
+        seconds,
+    )
+
+
+def _groq_reserve(
+    estimated_tokens: int,
+    budget: int,
+    max_wait_seconds: float,
+) -> float:
+    """
+    Reserve estimated tokens in the shared rolling window.
+
+    Raises LLMError instead of sending a request if the budget cannot
+    accommodate it within the configured waiting period.
+
+    Returns the reservation timestamp.
+    """
+    if budget <= 0:
+        raise LLMError("GROQ_TPM_BUDGET must be greater than zero.")
+
+    if estimated_tokens > budget:
+        raise LLMError(
+            "Estimated request size exceeds the configured Groq TPM budget "
+            f"({estimated_tokens} > {budget})."
+        )
+
+    deadline = time.monotonic() + max(0.0, max_wait_seconds)
+
+    while True:
+        now = time.monotonic()
+
+        with _GROQ_CONDITION:
+            _trim_groq_usage_locked(now)
+
+            cooldown_remaining = _GROQ_COOLDOWN_UNTIL - now
+
+            if cooldown_remaining > 0:
+                wait_remaining = deadline - now
+
+                if wait_remaining <= 0 or cooldown_remaining > wait_remaining:
+                    raise LLMError(
+                        "Groq is in cooldown for approximately "
+                        f"{cooldown_remaining:.1f} more seconds."
+                    )
+
+                _GROQ_CONDITION.wait(
+                    timeout=min(cooldown_remaining, wait_remaining, 1.0)
+                )
+                continue
+
+            used_tokens = sum(
+                int(entry[1]) for entry in _GROQ_USAGE
+            )
+
+            if used_tokens + estimated_tokens <= budget:
+                _GROQ_USAGE.append([now, float(estimated_tokens)])
+
+                log.debug(
+                    "Groq TPM reservation: estimated=%d, reserved=%d, "
+                    "budget=%d",
+                    estimated_tokens,
+                    used_tokens + estimated_tokens,
+                    budget,
+                )
+
+                return now
+
+            wait_remaining = deadline - now
+
+            if wait_remaining <= 0:
+                raise LLMError(
+                    "Groq TPM budget temporarily exhausted: "
+                    f"estimated used={used_tokens}, "
+                    f"requested={estimated_tokens}, budget={budget}."
+                )
+
+            oldest_timestamp = (
+                _GROQ_USAGE[0][0]
+                if _GROQ_USAGE
+                else now
+            )
+
+            until_window_frees = max(
+                0.05,
+                oldest_timestamp + _WINDOW_SECONDS - now,
+            )
+
+            _GROQ_CONDITION.wait(
+                timeout=min(until_window_frees, wait_remaining, 1.0)
+            )
+
+
+def _groq_adjust_reservation(
+    reservation_timestamp: float,
+    actual_tokens: int,
+) -> None:
+    """
+    Replace a successful request's estimate with actual usage when available.
+
+    The request is serialized by the Groq semaphore, so its reservation
+    remains identifiable while the request is in progress.
+    """
+    with _GROQ_CONDITION:
+        for entry in _GROQ_USAGE:
+            if entry[0] == reservation_timestamp:
+                entry[1] = float(max(0, actual_tokens))
+                break
+
+        _GROQ_CONDITION.notify_all()
+
+
+# ---------------------------------------------------------------------------
+# LLM client
+# ---------------------------------------------------------------------------
 
 class LLMClient:
     def __init__(self, settings: Settings):
         self.s = settings
+
         self._primary = self._make(
-            settings.api_key,
-            settings.base_url,
-            settings.llm_timeout,
+            getattr(settings, "api_key", ""),
+            getattr(settings, "base_url", ""),
+            getattr(settings, "llm_timeout", 60),
         )
 
-        has_fallback = settings.fallback_base_url and settings.fallback_model
+        fallback_url = getattr(settings, "fallback_base_url", "")
+        fallback_model = getattr(settings, "fallback_model", "")
+
+        has_fallback = bool(fallback_url and fallback_model)
+
+        # Ollama's OpenAI-compatible endpoint commonly accepts any nonempty
+        # API key. "ollama" is a placeholder, not a real credential.
+        fallback_key = (
+            getattr(settings, "fallback_api_key", None) or "ollama"
+        )
 
         self._fallback = (
             self._make(
-                settings.fallback_api_key,
-                settings.fallback_base_url,
-                settings.fallback_timeout,
+                fallback_key,
+                fallback_url,
+                getattr(settings, "fallback_timeout", 180),
             )
             if has_fallback
             else None
         )
 
-    def _make(self, key: str, url: str, timeout: float):
+        self._primary_is_groq = _is_groq_url(
+            getattr(settings, "base_url", "")
+        )
+
+    def _make(self, key: str | None, url: str | None, timeout: float):
+        """Create an OpenAI-compatible client with SDK retries disabled."""
+        if not url:
+            return None
+
         if not key:
             return None
 
@@ -100,126 +370,484 @@ class LLMClient:
 
     @property
     def configured(self) -> bool:
+        """Whether the primary provider is configured."""
         return self._primary is not None
 
-    def chat_text(self, role: str, system: str, user: str, max_tokens: int = 1500,
-                  json_mode: bool = False, temperature: float = 0.2) -> str:
+    # -----------------------------------------------------------------------
+    # Public text interface
+    # -----------------------------------------------------------------------
+
+    def chat_text(
+        self,
+        role: str,
+        system: str,
+        user: str,
+        max_tokens: int = 1500,
+        json_mode: bool = False,
+        temperature: float = 0.2,
+    ) -> str:
+        """
+        Generate text using the primary provider and then the local fallback.
+
+        Provider failures are isolated here so a Groq failure does not
+        prevent the fallback from being attempted.
+        """
         if self._primary is None:
-            raise LLMError("LLM_API_KEY is not set on the server.")
-        targets = [(self._primary, self.s.model_for(role))]
+            raise LLMError(
+                "Primary LLM client is not configured. "
+                "Check LLM_API_KEY and the primary base URL."
+            )
+
+        targets = [
+            (
+                self._primary,
+                self.s.model_for(role),
+                self._primary_is_groq,
+                "primary",
+            )
+        ]
+
         if self._fallback is not None:
-            targets.append((self._fallback, self.s.fallback_model))
-        errors = []
-        for client, model in targets:
+            targets.append(
+                (
+                    self._fallback,
+                    self.s.fallback_model,
+                    False,
+                    "fallback",
+                )
+            )
+
+        errors: list[str] = []
+
+        for client, model, is_groq, provider_name in targets:
             try:
-                return self._call(client, model, system, user, max_tokens, json_mode, temperature)
+                result = self._call(
+                    client=client,
+                    model=model,
+                    system=system,
+                    user=user,
+                    provider_name=provider_name,
+                    role=role,
+                    max_tokens=max_tokens,
+                    json_mode=json_mode,
+                    temperature=temperature,
+                    is_groq=is_groq,
+                )
+
+                log.debug(
+                    "LLM request succeeded: provider=%s, role=%s, model=%s",
+                    provider_name,
+                    role,
+                    model,
+                )
+
+                return result
+
             except LLMError as e:
-                log.warning("model %s failed for role %s: %s", model, role, e)
-                errors.append(f"{model}: {e}")
-        raise LLMError(" | ".join(errors))
+                log.warning(
+                    "LLM provider failed: provider=%s, role=%s, model=%s, "
+                    "error=%s",
+                    provider_name,
+                    role,
+                    model,
+                    e,
+                )
+
+                errors.append(f"{provider_name}/{model}: {e}")
+
+        raise LLMError(
+            "All configured LLM providers failed. " + " | ".join(errors)
+        )
+
+    # -----------------------------------------------------------------------
+    # Internal request implementation
+    # -----------------------------------------------------------------------
 
     def _call(
         self,
         client,
-        model,
-        system,
-        user,
-        max_tokens,
-        json_mode,
-        temperature,
+        model: str,
+        system: str,
+        user: str,
+        provider_name: str,
+        role: str,
+        max_tokens: int,
+        json_mode: bool,
+        temperature: float,
+        is_groq: bool = False,
     ) -> str:
-        kwargs = {
+        """Send a request with retries, rate-limit protection and error handling."""
+        kwargs: dict[str, Any] = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": max_tokens,
             "temperature": temperature,
         }
+
+        # Keep the output-token limit for the primary provider.
+        # Let the local fallback generate without an application-level output cap.
+        if provider_name != "fallback":
+            kwargs["max_tokens"] = max_tokens
 
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        max_attempts = 3
+        # Local requests should not spend several minutes retrying.
+        # Groq also gets a bounded retry policy.
+        max_attempts = 2 if is_groq else 1
+
         last_error = "unknown error"
 
         for attempt in range(max_attempts):
+            reservation_timestamp: float | None = None
+            semaphore_acquired = False
+
             try:
-                response = client.chat.completions.create(**kwargs)
+                if is_groq:
+                    # Only one Groq request at a time in this process.
+                    wait_seconds = float(
+                        getattr(self.s, "groq_wait_seconds", 5)
+                    )
+
+                    semaphore_acquired = _GROQ_SEMAPHORE.acquire(
+                        timeout=max(0.0, wait_seconds)
+                    )
+
+                    if not semaphore_acquired:
+                        raise LLMError(
+                            "Timed out waiting for the shared Groq request slot."
+                        )
+
+                    budget = int(
+                        getattr(self.s, "groq_tpm_budget", 4500)
+                    )
+
+                    estimated_tokens = _estimate_tokens(
+                        system=system,
+                        user=user,
+                        max_tokens=max_tokens,
+                    )
+
+                    reservation_timestamp = _groq_reserve(
+                        estimated_tokens=estimated_tokens,
+                        budget=budget,
+                        max_wait_seconds=wait_seconds,
+                    )
+
+                if not is_groq:
+                    messages = kwargs.get("messages", [])
+                    prompt_chars = sum(
+                        len(str(message.get("content", "")))
+                        for message in messages
+                    )
+
+                    log.info(
+                        "Ollama request: model=%s, prompt_chars=%d, max_tokens=%s",
+                        model,
+                        prompt_chars,
+                        kwargs.get("max_tokens"),
+                    )
+                    # log.info(
+                    #     "Ollama response: model=%s finish_reason=%s "
+                    #     "prompt_tokens=%s completion_tokens=%s",
+                    #     model,
+                    #     response.choices[0].finish_reason,
+                    #     getattr(response.usage, "prompt_tokens", None),
+                    #     getattr(response.usage, "completion_tokens", None),
+                    # )
+
+                request_started = time.perf_counter()
+
+                messages = kwargs.get("messages", [])
+                prompt_chars = sum(
+                    len(str(message.get("content", "")))
+                    for message in messages
+                )
+
+                try:
+                    response = client.chat.completions.create(**kwargs)
+
+                except Exception:
+                    elapsed = time.perf_counter() - request_started
+
+                    log.exception(
+                        "LLM request failed: provider_name=%s role=%s model=%s "
+                        "duration_seconds=%.2f prompt_chars=%d max_tokens=%s",
+                        provider_name,
+                        role,
+                        model,
+                        elapsed,
+                        prompt_chars,
+                        kwargs.get("max_tokens"),
+                    )
+                    raise
+
+                elapsed = time.perf_counter() - request_started
+
+                usage = getattr(response, "usage", None)
+
+                prompt_tokens = getattr(usage, "prompt_tokens", None)
+                completion_tokens = getattr(usage, "completion_tokens", None)
+                total_tokens = getattr(usage, "total_tokens", None)
+
+                log.info(
+                    "LLM request completed: provider=%s role=%s model=%s "
+                    "duration_seconds=%.2f prompt_chars=%d max_tokens=%s "
+                    "prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                    provider_name,
+                    role,
+                    model,
+                    elapsed,
+                    prompt_chars,
+                    kwargs.get("max_tokens"),
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                )
+                usage = getattr(response, "usage", None)
+                prompt_tokens = getattr(usage, "prompt_tokens", None)
+                completion_tokens = getattr(usage, "completion_tokens", None)
+
+                choices = getattr(response, "choices", None) or []
+                finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+
+                if not is_groq:
+                    log.info(
+                        "Ollama response: model=%s finish_reason=%s "
+                        "prompt_tokens=%s completion_tokens=%s",
+                        model,
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                    )
+
                 content = response.choices[0].message.content or ""
                 content = content.strip()
 
-                if content:
-                    return content
+                if not content:
+                    last_error = "empty response"
 
-                last_error = "empty response"
+                    if attempt < max_attempts - 1:
+                        time.sleep(0.5)
+                        continue
+
+                    break
+
+                # If the provider reports actual token usage, update the
+                # successful Groq reservation with that value.
+                if is_groq and reservation_timestamp is not None:
+                    usage = getattr(response, "usage", None)
+
+                    if usage is not None:
+                        actual_tokens = getattr(
+                            usage,
+                            "total_tokens",
+                            None,
+                        )
+
+                        if actual_tokens is not None:
+                            _groq_adjust_reservation(
+                                reservation_timestamp,
+                                int(actual_tokens),
+                            )
+                log.info(
+                    "LLM finish reason: role=%s model=%s finish_reason=%s",
+                    role,
+                    model,
+                    response.choices[0].finish_reason,
+                )
+                return content
 
             except RateLimitError as e:
-                # No insistir inmediatamente contra el mismo límite.
+                detail = _msg(e)
+
+                if is_groq:
+                    default_cooldown = float(
+                        getattr(self.s, "groq_cooldown_seconds", 60)
+                    )
+
+                    cooldown = _retry_after_seconds(
+                        e,
+                        default=default_cooldown,
+                    )
+
+                    _groq_set_cooldown(cooldown)
+
                 raise LLMError(
-                    f"rate limit reached: {_msg(e)}"
+                    f"HTTP 429 rate limit reached: {detail}"
                 ) from e
 
             except BadRequestError as e:
                 detail = _msg(e)
+                lower_detail = detail.lower()
 
-                # Intentar sin JSON mode únicamente si el error
-                # parece estar relacionado con esa opción.
+                # Some OpenAI-compatible servers do not support JSON mode.
+                # Retry once without response_format if that is the problem.
+                json_mode_terms = (
+                    "response_format",
+                    "json_object",
+                    "json mode",
+                    "structured output",
+                    "json_validate_failed",
+                    "failed to generate json",
+                )
+
                 if (
                     "response_format" in kwargs
-                    and any(
-                        term in detail.lower()
-                        for term in (
-                            "response_format",
-                            "json_object",
-                            "json mode",
-                            "structured output",
-                        )
-                    )
+                    and any(term in lower_detail for term in json_mode_terms)
                 ):
                     kwargs.pop("response_format")
+
+                    log.warning(
+                        "Model %s rejected JSON mode; retrying without "
+                        "response_format.",
+                        model,
+                    )
+
                     last_error = f"JSON mode unsupported: {detail}"
                     continue
 
                 raise LLMError(
-                    f"bad request: {detail}"
+                    f"HTTP 400 bad request: {detail}"
                 ) from e
 
             except (APITimeoutError, APIConnectionError) as e:
                 last_error = (
-                    f"connection/timeout error: {type(e).__name__}"
+                    f"{type(e).__name__}: {_msg(e)}"
+                )
+
+                log.warning(
+                    "LLM connection/timeout: model=%s, attempt=%d/%d, "
+                    "error=%s",
+                    model,
+                    attempt + 1,
+                    max_attempts,
+                    last_error,
                 )
 
             except APIStatusError as e:
+                detail = _msg(e)
+
                 if e.status_code < 500:
                     raise LLMError(
-                        f"HTTP {e.status_code}: {_msg(e)}"
+                        f"HTTP {e.status_code}: {detail}"
                     ) from e
 
-                last_error = f"server error {e.status_code}"
+                last_error = (
+                    f"HTTP {e.status_code}: {detail}"
+                )
 
-            # No esperar después del último intento.
+                log.warning(
+                    "LLM server error: model=%s, attempt=%d/%d, error=%s",
+                    model,
+                    attempt + 1,
+                    max_attempts,
+                    last_error,
+                )
+
+            except LLMError:
+                # Do not retry rate-limit guard/cooldown errors here.
+                # chat_text() will move on to the fallback.
+                raise
+
+            except Exception as e:
+                # Preserve unexpected failures as controlled provider errors.
+                log.exception(
+                    "Unexpected LLM error: model=%s",
+                    model,
+                )
+
+                raise LLMError(
+                    f"Unexpected {type(e).__name__}: {_msg(e)}"
+                ) from e
+
+            finally:
+                if semaphore_acquired:
+                    _GROQ_SEMAPHORE.release()
+
+            # Backoff only for retryable errors; never wait after the last try.
             if attempt < max_attempts - 1:
-                delay = min(2 ** attempt, 8)
-                time.sleep(delay + random.uniform(0, 0.5))
+                delay = min(2 ** attempt, 4)
+                time.sleep(delay + random.uniform(0, 0.3))
 
         raise LLMError(
             f"{last_error} after {max_attempts} attempts"
         )
 
-    def chat_json(self, role: str, system: str, user: str, required=(), max_tokens: int = 1200) -> dict:
-        raw = self.chat_text(role, system, user, max_tokens=max_tokens, json_mode=True, temperature=0)
+    # -----------------------------------------------------------------------
+    # Public JSON interface
+    # -----------------------------------------------------------------------
+
+    def chat_json(
+        self,
+        role: str,
+        system: str,
+        user: str,
+        required=(),
+        max_tokens: int = 1200,
+    ) -> dict:
+        """
+        Generate a JSON object and validate required keys.
+
+        If parsing or validation fails, ask the configured providers to repair
+        the response once. The repair request still uses chat_text(), so it
+        receives the same Groq guard and fallback behavior.
+        """
+        raw = self.chat_text(
+            role=role,
+            system=system,
+            user=user,
+            max_tokens=max_tokens,
+            json_mode=True,
+            temperature=0,
+        )
+
         for attempt in range(2):
             try:
                 obj = parse_json(raw)
-                missing = [k for k in required if k not in obj]
+
+                missing = [
+                    key for key in required
+                    if key not in obj
+                ]
+
                 if missing:
-                    raise ValueError(f"missing keys {missing}")
+                    raise ValueError(
+                        f"missing required keys: {missing}"
+                    )
+
                 return obj
+
             except ValueError as e:
                 if attempt == 1:
-                    raise LLMError(f"malformed JSON from {role}: {e}") from e
-                repair = f"{user}\n\nYour previous reply was invalid ({e}). Reply again with ONLY the JSON object."
-                raw = self.chat_text(role, system, repair, max_tokens=max_tokens, json_mode=True, temperature=0)
-        raise LLMError("unreachable")
+                    raise LLMError(
+                        f"Malformed JSON from role '{role}': {e}"
+                    ) from e
+
+                log.warning(
+                    "Invalid JSON from role=%s; requesting one repair: %s",
+                    role,
+                    e,
+                )
+
+                repair_prompt = (
+                    f"{user}\n\n"
+                    "Your previous response was invalid. "
+                    f"Validation error: {e}\n"
+                    "Return ONLY one valid JSON object. "
+                    "Do not include Markdown fences, explanations, "
+                    "or text outside the JSON object."
+                )
+
+                raw = self.chat_text(
+                    role=role,
+                    system=system,
+                    user=repair_prompt,
+                    max_tokens=max_tokens,
+                    json_mode=True,
+                    temperature=0,
+                )
+
+        raise LLMError("Unreachable JSON validation state.")

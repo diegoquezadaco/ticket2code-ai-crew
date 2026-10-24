@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+import ast
 import re
 from typing import Iterator
 
@@ -135,283 +136,854 @@ def format_reply(
 
 
 def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterator[dict]:
-    t0 = time.time()
+    t0 = time.perf_counter()
+
     events: list = []
     stage = "router"
 
-    def log_event(agent: str, text: str, data=None) -> dict:
-        e = {"type": "log", "t": round(time.time() - t0, 1), "agent": agent, "message": text}
-        if data is not None:
-            e["data"] = data
-        events.append(e)
-        return e
-
-    prior_history = list(session.history)
+    # Initialize all state before entering the pipeline.
     intent = "unknown"
     lang = session.lang if session.lang in LABELS else "es"
     plan = session.plan or {}
-    delivery_files = {}
+    files: dict = {}
+    delivery_files: dict = {}
     attempts = 0
+    max_attempts = settings.max_retries + 1
+    approved = False
+    docs_approved = False
+    issues: list = []
+    status = "running"
+
+    def log_event(agent: str, text: str, data=None) -> dict:
+        event = {
+            "type": "log",
+            "t": round(time.perf_counter() - t0, 1),
+            "agent": agent,
+            "message": text,
+        }
+        if data is not None:
+            event["data"] = data
+        events.append(event)
+        return event
+
+    def normalize_issues(value) -> list[str]:
+        """Convert structured findings into actionable, readable feedback."""
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            text = value.strip()
+
+            if not text:
+                return []
+
+            # Some model responses serialize a dictionary as a string
+            # inside code_issues. Parse only Python literals; never use eval().
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    parsed = ast.literal_eval(text)
+                except (ValueError, SyntaxError):
+                    parsed = None
+
+                if isinstance(parsed, dict):
+                    return normalize_issues(parsed)
+
+            return [text]
+
+        if isinstance(value, dict):
+            # Support common reviewer/checker schemas.
+            preferred_fields = (
+                "description",
+                "issue",
+                "problem",
+                "change_needed",
+                "fix",
+                "suggestion",
+                "file",
+                "line",
+            )
+
+            parts = [
+                f"{key}: {value[key]}"
+                for key in preferred_fields
+                if value.get(key) not in (None, "")
+            ]
+
+            if parts:
+                return ["; ".join(parts)]
+
+            # Do not discard a finding when its schema is unexpected.
+            return [str(value)]
+
+        if isinstance(value, (list, tuple)):
+            result = []
+
+            for item in value:
+                result.extend(normalize_issues(item))
+
+            return result
+
+        return [str(value)]
+
+    def is_readme(path: str) -> bool:
+        return path.rsplit("/", 1)[-1].lower() == "readme.md"
 
     try:
+        prior_history = list(session.history)
+
+        # ---------------------------------------------------------
+        # 1. Router / clarification
+        # ---------------------------------------------------------
         pending = session.pending_clarification
+
         if pending:
-            # This is the one and only clarification response. Continue without asking again.
+            # Continue from the one permitted clarification round.
             session.pending_clarification = None
             lang = pending["lang"]
             intent = pending["intent"]
+
             message = (
                 f"Original request:\n{pending['request']}\n\n"
                 f"User's answers to the clarification questions:\n{message}\n\n"
-                "Proceed using these answers. If any detail remains unspecified, make a reasonable "
-                "assumption and record it; do not ask more questions."
+                "Proceed using these answers. If any detail remains unspecified, "
+                "make a reasonable assumption and record it; do not ask more questions."
             )
-            route = {"intent": intent, "lang": lang, "reason": "Received clarification answers"}
+
+            route = {
+                "intent": intent,
+                "lang": lang,
+                "reason": "Received clarification answers",
+            }
         else:
-            route = agents.route(llm, message, prior_history, session.summary)
+            stage = "router"
+            stage_started = time.perf_counter()
+
+            try:
+                route = agents.route(
+                    llm,
+                    message,
+                    prior_history,
+                    session.summary,
+                )
+            finally:
+                log.info(
+                    "Agent timing: stage=router duration_seconds=%.2f",
+                    time.perf_counter() - stage_started,
+                )
+
             intent, lang = route["intent"], route["lang"]
 
             if not session.files:
-                intent = {"change_request": "new_ticket", "question": "chat"}.get(intent, intent)
+                intent = {
+                    "change_request": "new_ticket",
+                    "question": "chat",
+                }.get(intent, intent)
+
             session.lang = lang
 
             if intent == "clarification":
                 questions = route["questions"][:5]
+
                 if not questions:
                     questions = [{
                         "question": "Which option best matches what you want?",
-                        "options": ["A simple version", "A more complete version", "Other / specify"],
+                        "options": [
+                            "A simple version",
+                            "A more complete version",
+                            "Other / specify",
+                        ],
                     }]
 
                 lines = []
+
                 for index, item in enumerate(questions, start=1):
                     lines.append(f"{index}. {item['question']}")
-                    if item["options"]:
-                        lines.append("   Options: " + " / ".join(item["options"]))
+
+                    if item.get("options"):
+                        lines.append(
+                            "   Options: " + " / ".join(item["options"])
+                        )
 
                 reply = "\n".join(lines)
+
                 session.pending_clarification = {
                     "request": message,
                     "intent": route["resume_intent"],
                     "lang": lang,
                 }
-                session.history.append({"role": "user", "content": message})
-                session.history.append({"role": "assistant", "content": reply})
-                yield log_event("router", "Asked one round of clarification questions", {
-                    "questions": questions,
+
+                session.history.append({
+                    "role": "user",
+                    "content": message,
                 })
+                session.history.append({
+                    "role": "assistant",
+                    "content": reply,
+                })
+
+                yield log_event(
+                    "router",
+                    "Asked one round of clarification questions",
+                    {"questions": questions},
+                )
+
                 yield {
-                    "type": "final", "status": "clarification", "reply": reply,
-                    "t": round(time.time() - t0, 1),
+                    "type": "final",
+                    "status": "clarification",
+                    "reply": reply,
+                    "t": round(time.perf_counter() - t0, 1),
                 }
                 return
 
         session.lang = lang
         session.history.append({"role": "user", "content": message})
+
         yield log_event("router", f"intent: {intent}", route)
 
-        # Keep the existing question/chat handler here.
+        # ---------------------------------------------------------
+        # 2. Handle normal questions and chat
+        # ---------------------------------------------------------
         if intent in ("question", "chat"):
             stage = "assistant"
-            text = agents.answer(llm, message, prior_history, session.plan, session.files, session.open_issues)
-            yield log_event("assistant", "Answered from the conversation context")
-            session.history.append({"role": "assistant", "content": text[:600]})
-            yield {"type": "final", "status": "answer", "reply": text, "t": round(time.time() - t0, 1)}
+            stage_started = time.perf_counter()
+
+            try:
+                text = agents.answer(
+                    llm,
+                    message,
+                    prior_history,
+                    session.plan,
+                    session.files,
+                    session.open_issues,
+                )
+            finally:
+                log.info(
+                    "Agent timing: stage=assistant duration_seconds=%.2f",
+                    time.perf_counter() - stage_started,
+                )
+
+            yield log_event(
+                "assistant",
+                "Answered from the conversation context",
+            )
+
+            session.history.append({
+                "role": "assistant",
+                "content": text[:600],
+            })
+
+            yield {
+                "type": "final",
+                "status": "answer",
+                "reply": text,
+                "t": round(time.perf_counter() - t0, 1),
+            }
             return
 
+        # ---------------------------------------------------------
+        # 3. Planner
+        # ---------------------------------------------------------
         is_change = intent == "change_request"
         stage = "planner"
-        plan = agents.make_plan(
-            llm, message, lang,
-            session.plan if is_change else None,
-            session.files if is_change else {},
-            session.open_issues if is_change else [],
-        )
-        
+        stage_started = time.perf_counter()
+
+        try:
+            plan = agents.make_plan(
+                llm,
+                message,
+                lang,
+                session.plan if is_change else None,
+                session.files if is_change else {},
+                session.open_issues if is_change else [],
+            )
+        finally:
+            log.info(
+                "Agent timing: stage=planner duration_seconds=%.2f",
+                time.perf_counter() - stage_started,
+            )
+
         if plan.get("questions"):
-            questions_text = "\n".join(f"- {q}" for q in plan["questions"])
-            reply_msg = f"Necesito aclarar algunos puntos antes de continuar:\n{questions_text}"
-            session.history.append({"role": "assistant", "content": reply_msg})
-            yield log_event("planner", "Plan returned clarifying questions due to missing details", plan)
-            yield {"type": "final", "status": "clarification", "reply": reply_msg, "t": round(time.time() - t0, 1)}
+            questions_text = "\n".join(
+                f"- {question}" for question in plan["questions"]
+            )
+
+            reply_msg = (
+                f"Necesito aclarar algunos puntos antes de continuar:\n"
+                f"{questions_text}"
+            )
+
+            session.history.append({
+                "role": "assistant",
+                "content": reply_msg,
+            })
+
+            yield log_event(
+                "planner",
+                "Plan returned clarifying questions due to missing details",
+                plan,
+            )
+
+            yield {
+                "type": "final",
+                "status": "clarification",
+                "reply": reply_msg,
+                "t": round(time.perf_counter() - t0, 1),
+            }
             return
 
         yield log_event(
             "planner",
-            f"Plan '{plan['title']}': {len(plan['tasks'])} tasks, {len(plan['assumptions'])} assumptions",
+            f"Plan '{plan['title']}': "
+            f"{len(plan['tasks'])} tasks, "
+            f"{len(plan['assumptions'])} assumptions",
             plan,
         )
 
-        files = dict(session.files) if is_change else {}
+        # README is deliberately excluded from implementation work.
+        files = {
+            path: content
+            for path, content in (
+                dict(session.files) if is_change else {}
+            ).items()
+            if not is_readme(path)
+        }
+
         delivery_files = dict(files)
-        max_attempts = settings.max_retries + 1
+
+        # =========================================================
+        # 4. IMPLEMENTATION RETRY LOOP
+        #
+        # Coder -> static checks -> reviewer
+        #
+        # The documentarian and documentation checks must not run
+        # anywhere inside this loop.
+        # =========================================================
         feedback_code: list[str] = []
-        feedback_docs: list[str] = []
-        approved, issues, attempts = False, [], 0
+        approved = False
+        issues = []
+        attempts = 0
+
+        # Checkpoint the latest successfully generated implementation.
+        last_successful_files = dict(files)
+        generation_error = None
 
         for attempt in range(1, max_attempts + 1):
             attempts = attempt
 
-            # Ejecutar el Coder en la primera ronda o cuando haya observaciones de código.
-            if attempt == 1 or feedback_code:
-                stage = "coder"
-                coder_files = {
-                    path: content
-                    for path, content in files.items()
-                    if path.rsplit("/", 1)[-1].lower() != "readme.md"
-                }
-                coder_feedback = "\n".join(feedback_code) or None
-                note = "addressing code feedback" if coder_feedback else "first version"
-                yield log_event(
-                    "coder",
-                    f"Attempt {attempt}/{max_attempts}: {note}",
-                    {"feedback": coder_feedback} if coder_feedback else None,
-                )
+            # -----------------------------------------------------
+            # 4a. Coder
+            # -----------------------------------------------------
+            stage = "coder"
 
-                new_files, notes = agents.write_code(
-                    llm, plan, coder_files, coder_feedback, attempt
-                )
+            coder_files = {
+                path: content
+                for path, content in files.items()
+                if not is_readme(path)
+            }
 
-                # README.md pertenece exclusivamente al Documenter.
-                files.update({
-                    path: content
-                    for path, content in new_files.items()
-                    if path.rsplit("/", 1)[-1].lower() != "readme.md"
-                })
-                delivery_files = dict(files)
-                yield log_event(
-                    "coder",
-                    f"Wrote {len(new_files)} file(s): "
-                    f"{', '.join(new_files) if new_files else '(none)'}",
-                    {"notes": notes} if notes else None,
-                )
-            else:
-                yield log_event(
-                    "coder",
-                    "Skipped: only documentation changes are requested",
-                )
+            coder_feedback = "\n".join(feedback_code) or None
+            note = (
+                "addressing code feedback"
+                if coder_feedback
+                else "first version"
+            )
 
-            # Regenerar el README completo con los archivos y comandos actuales.
-            stage = "documenter"
             yield log_event(
-                "documenter",
-                "Generating README.md",
-                {"feedback": feedback_docs} if feedback_docs else None,
-            )
-            files["README.md"] = agents.document_project(
-                llm, plan, files, lang, feedback_docs or None
-            )
-            delivery_files = dict(files)
-
-            stage = "reviewer"
-            code_problems = agents.static_checks(files)
-            docs_problems = (
-                agents.documentation_checks(plan, files)
-                if hasattr(agents, "documentation_checks")
-                else []
+                "coder",
+                f"Attempt {attempt}/{max_attempts}: {note}",
+                {"feedback": coder_feedback} if coder_feedback else None,
             )
 
-            if code_problems:
-                review = {
-                    "approved": False,
-                    "code_issues": code_problems,
-                    "documentation_issues": docs_problems,
-                    "feedback": "Fix automated code checks:\n"
-                    + "\n".join(code_problems),
-                }
-                yield log_event(
-                    "checks",
-                    "Automated checks failed",
-                    {"problems": code_problems},
+            stage_started = time.perf_counter()
+
+            try:
+                new_files, notes = agents.write_code(
+                    llm,
+                    plan,
+                    coder_files,
+                    coder_feedback,
+                    attempt,
                 )
-            else:
-                yield log_event("checks", "Syntax checks passed")
-                review = agents.review(llm, plan, files, lang)
+            except Exception as exc:
+                generation_error = str(exc)
 
-                # Asegura la compatibilidad si review() devuelve el formato anterior.
-                review.setdefault("code_issues", [])
-                review.setdefault("documentation_issues", [])
-                if review.get("issues") and not (
-                    review["code_issues"] or review["documentation_issues"]
-                ):
-                    review["code_issues"] = review["issues"]
+                # Restore the last successfully generated files.
+                files = dict(last_successful_files)
+                delivery_files = dict(last_successful_files)
 
-                if docs_problems:
-                    review["documentation_issues"] = (
-                        list(review["documentation_issues"]) + docs_problems
-                    )
-
-                review["approved"] = (
-                    review.get("approved") is True
-                    and not review["code_issues"]
-                    and not review["documentation_issues"]
-                )
-
-            code_issues = review.get("code_issues", [])
-            documentation_issues = review.get("documentation_issues", [])
-            issues = list(code_issues) + list(documentation_issues)
-
-            if review["approved"]:
-                yield log_event(
-                    "reviewer",
-                    "Approved",
-                    {"feedback": review.get("feedback", "")},
-                )
-                approved = True
-                break
-
-            yield log_event("reviewer", f"Rejected with {len(issues)} issue(s)", review)
-
-            # Enrutar observaciones al agente responsable.
-            feedback_code = list(code_issues)
-            feedback_docs = list(documentation_issues)
-
-            # Evita rondas sin acción si el Reviewer rechaza sin clasificar el problema.
-            if not feedback_code and not feedback_docs:
-                feedback_code = [
-                    review.get("feedback") or "Reviewer rejected the delivery; inspect the code."
+                issues = [
+                    f"Code generation failed on attempt {attempt}: {generation_error}"
                 ]
 
+                yield log_event(
+                    "coder",
+                    "Code generation failed; preserving the last successful files",
+                    {
+                        "attempt": attempt,
+                        "error": generation_error,
+                        "preserved_files": list(files.keys()),
+                    },
+                )
+
+                # Exit the implementation loop and continue to finalization.
+                break
+            finally:
+                log.info(
+                    "Agent timing: stage=coder attempt=%d duration_seconds=%.2f",
+                    attempt,
+                    time.perf_counter() - stage_started,
+                )
+
+
+            # The coder never owns README.md.
+            files.update({
+                path: content
+                for path, content in new_files.items()
+                if not is_readme(path)
+            })
+
+            # Remove any README that might have been inherited or
+            # returned accidentally.
+            files = {
+                path: content
+                for path, content in files.items()
+                if not is_readme(path)
+            }
+
+            delivery_files = dict(files)
+            # Save the latest successfully generated source and test files.
+            last_successful_files = dict(files)
+
+            yield log_event(
+                "coder",
+                f"Wrote {len(new_files)} file(s): "
+                f"{', '.join(new_files) if new_files else '(none)'}",
+                {"notes": notes} if notes else None,
+            )
+
+            # -----------------------------------------------------
+            # 4b. Static checks on implementation only
+            # -----------------------------------------------------
+            stage = "static_checks"
+            stage_started = time.perf_counter()
+
+            try:
+                code_problems = normalize_issues(
+                    agents.static_checks(files)
+                )
+            finally:
+                log.info(
+                    "Agent timing: stage=static_checks attempt=%d duration_seconds=%.2f",
+                    attempt,
+                    time.perf_counter() - stage_started,
+                )
+
+            if code_problems:
+                feedback_code = code_problems
+                issues = code_problems
+
+                yield log_event(
+                    "checks",
+                    "Static checks failed; implementation needs correction",
+                    {"problems": code_problems},
+                )
+
+                if attempt < max_attempts:
+                    continue
+
+                # Retry limit reached. Do not invoke the reviewer
+                # for an implementation that failed static checks.
+                break
+
+            yield log_event(
+                "checks",
+                "Static checks passed",
+            )
+
+            # -----------------------------------------------------
+            # 4c. Reviewer evaluates accepted-plan criteria and code
+            # -----------------------------------------------------
+            stage = "reviewer"
+            stage_started = time.perf_counter()
+
+            try:
+                # `files` contains no README.md, so the reviewer
+                # evaluates the implementation independently.
+                review = agents.review(
+                    llm,
+                    plan,
+                    files,
+                    lang,
+                )
+            finally:
+                log.info(
+                    "Agent timing: stage=reviewer attempt=%d duration_seconds=%.2f",
+                    attempt,
+                    time.perf_counter() - stage_started,
+                )
+
+            code_issues = normalize_issues(
+                review.get("code_issues", [])
+            )
+
+            # Compatibility with reviewers that return a generic
+            # issues field. Do not use documentation_issues to decide
+            # whether the implementation itself is approved.
+            if not code_issues and review.get("issues"):
+                code_issues = normalize_issues(review["issues"])
+
+            reviewer_approved = review.get("approved") is True
+
+            # Approval requires an explicit approval and no
+            # outstanding code findings.
+            if reviewer_approved and not code_issues:
+                approved = True
+                issues = []
+
+                yield log_event(
+                    "reviewer",
+                    "Implementation approved",
+                    {
+                        "attempt": attempt,
+                        "feedback": review.get("feedback", ""),
+                    },
+                )
+                break
+
+            # Reviewer rejected the implementation.
+            feedback_code = code_issues
+
+            if not feedback_code:
+                feedback = review.get("feedback", "")
+
+                feedback_code = [
+                    str(feedback).strip()
+                    if feedback and str(feedback).strip()
+                    else (
+                        "The reviewer did not approve the implementation. "
+                        "Recheck the plan and acceptance criteria, and "
+                        "address any implementation gaps."
+                    )
+                ]
+
+            issues = feedback_code
+
+            yield log_event(
+                "reviewer",
+                f"Implementation rejected with {len(issues)} issue(s)",
+                {
+                    "code_issues": issues,
+                    "feedback": review.get("feedback", ""),
+                },
+            )
+
+            if attempt == max_attempts:
+                break
+
         if not approved:
+            status = "not_approved"
+
             yield log_event(
                 "system",
-                f"Retry limit reached ({max_attempts} attempts) without approval",
+                f"Implementation retry limit reached "
+                f"({max_attempts} attempts) without approval",
                 {"open_issues": issues},
             )
 
-        session.plan, session.files = plan, files
-        session.open_issues = [] if approved else issues
-        status = "approved" if approved else "not_approved"
-        session.summary = f"{plan['title']} | files: {', '.join(files)} | status: {status.upper()}"
-        session.history.append({"role": "assistant", "content": session.summary + ("" if approved else f" | open issues: {issues}")})
-        
-        # Asignamos la etapa a formatter antes de construir la respuesta final
+        # =========================================================
+        # 5. DOCUMENTATION PHASE
+        #
+        # Runs only after implementation approval.
+        # README revisions never rerun the coder or reviewer.
+        # =========================================================
+        if approved:
+            accepted_files = {
+                path: content
+                for path, content in files.items()
+                if not is_readme(path)
+            }
+
+            # Preserve the accepted source/test snapshot. All
+            # documentation attempts read from this same snapshot.
+            delivery_files = dict(accepted_files)
+
+            docs_max_attempts = settings.max_retries + 1
+            feedback_docs: list[str] = []
+            docs_approved = False
+            docs_issues: list[str] = []
+
+            # Fail explicitly if documentation checks are not
+            # configured. Do not silently mark unchecked docs valid.
+            documentation_checks = getattr(
+                agents,
+                "documentation_checks",
+                None,
+            )
+
+            if not callable(documentation_checks):
+                raise RuntimeError(
+                    "Documentation validation is required, but "
+                    "agents.documentation_checks is unavailable."
+                )
+
+            # Generate deterministic commands from the accepted code.
+            # Pass them through the plan context so the documentarian
+            # can use them rather than inventing commands.
+            documentation_plan = dict(plan)
+            documentation_plan["deterministic_commands"] = (
+                get_deterministic_commands(accepted_files)
+            )
+
+            for docs_attempt in range(1, docs_max_attempts + 1):
+                stage = "documentarian"
+
+                yield log_event(
+                    "documenter",
+                    f"Generating README.md "
+                    f"(documentation attempt {docs_attempt}/"
+                    f"{docs_max_attempts})",
+                    {"feedback": feedback_docs} if feedback_docs else None,
+                )
+
+                # -------------------------------------------------
+                # 5a. Documentarian
+                # -------------------------------------------------
+                stage_started = time.perf_counter()
+
+                try:
+                    readme = agents.document_project(
+                        llm,
+                        documentation_plan,
+                        accepted_files,
+                        lang,
+                        "\n".join(feedback_docs) if feedback_docs else None,
+                    )
+                finally:
+                    log.info(
+                        "Agent timing: stage=documentarian attempt=%d duration_seconds=%.2f",
+                        docs_attempt,
+                        time.perf_counter() - stage_started,
+                    )
+
+                if not isinstance(readme, str) or not readme.strip():
+                    feedback_docs = [
+                        "README.md must contain non-empty documentation "
+                        "for the accepted implementation."
+                    ]
+                    docs_issues = feedback_docs
+
+                    yield log_event(
+                        "documenter",
+                        "Generated README.md was empty or invalid",
+                        {"problems": docs_issues},
+                    )
+
+                    if docs_attempt < docs_max_attempts:
+                        continue
+
+                    break
+
+                candidate_files = {
+                    **accepted_files,
+                    "README.md": readme,
+                }
+
+                # -------------------------------------------------
+                # 5b. Documentation checks
+                # -------------------------------------------------
+                stage = "documentation_checks"
+                stage_started = time.perf_counter()
+
+                try:
+                    docs_issues = normalize_issues(
+                        documentation_checks(
+                            plan,
+                            candidate_files,
+                        )
+                    )
+                finally:
+                    log.info(
+                        "Agent timing: stage=documentation_checks "
+                        "attempt=%d duration_seconds=%.2f",
+                        docs_attempt,
+                        time.perf_counter() - stage_started,
+                    )
+
+                if not docs_issues:
+                    docs_approved = True
+                    files = candidate_files
+                    delivery_files = dict(files)
+
+                    yield log_event(
+                        "documentation_checks",
+                        "README.md passed documentation checks",
+                    )
+                    break
+
+                # Only documentation feedback is updated here.
+                # Accepted implementation files are never changed.
+                feedback_docs = docs_issues
+
+                yield log_event(
+                    "documentation_checks",
+                    f"README.md failed validation with "
+                    f"{len(docs_issues)} issue(s)",
+                    {"problems": docs_issues},
+                )
+
+                if docs_attempt == docs_max_attempts:
+                    break
+
+            if docs_approved:
+                status = "approved"
+                issues = []
+            else:
+                # Keep the last generated README for inspection, but
+                # explicitly identify it as unvalidated.
+                status = "documentation_failed"
+                issues = docs_issues
+
+                if "README.md" in candidate_files:
+                    files = candidate_files
+                else:
+                    files = dict(accepted_files)
+
+                delivery_files = dict(files)
+
+                yield log_event(
+                    "system",
+                    "Implementation was approved, but documentation "
+                    "validation exhausted its retry limit",
+                    {"open_issues": docs_issues},
+                )
+
+        # ---------------------------------------------------------
+        # 6. Final session state and response
+        # ---------------------------------------------------------
+        session.plan = plan
+        session.files = dict(files)
+
+        session.open_issues = (
+            []
+            if status == "approved"
+            else list(issues)
+        )
+
+        session.summary = (
+            f"{plan['title']} | "
+            f"files: {', '.join(files)} | "
+            f"status: {status.upper()}"
+        )
+
+        session.history.append({
+            "role": "assistant",
+            "content": session.summary
+            + ("" if status == "approved" else f" | open issues: {issues}"),
+        })
+
         stage = "formatter"
+
+        reply = format_reply(
+            lang=lang,
+            approved=approved,
+            attempts=attempts,
+            plan=plan,
+            files=files,
+            issues=issues,
+        )
+
+        # Do not conflate documentation failure with implementation
+        # rejection. The reviewer approved the implementation; the
+        # README simply did not pass its own validation.
+        if status == "documentation_failed":
+            warning = (
+                "DOCUMENTATION VALIDATION FAILED: The implementation "
+                "was approved, but README.md did not pass documentation "
+                "checks within the retry limit.\n\n"
+                "Documentation issues:\n"
+                + "\n".join(f"- {issue}" for issue in issues)
+            )
+
+            reply = warning + "\n\n" + reply
+
+        log.info(
+            "Pipeline completed: status=%s attempts=%d duration_seconds=%.2f",
+            status,
+            attempts,
+            time.perf_counter() - t0,
+        )
+
         yield {
-            "type": "final", "status": status, "attempts": attempts, "max_attempts": max_attempts,
-            "reply": format_reply(lang, approved, attempts, plan, files, issues),
-            "t": round(time.time() - t0, 1),
+            "type": "final",
+            "status": status,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "reply": reply,
+            "t": round(time.perf_counter() - t0, 1),
         }
+
+
     except LLMError as e:
-        session.history.append({"role": "assistant", "content": f"[error] pipeline failed at {stage}: {e}"})
-        yield log_event("system", f"Failed at {stage}: {e}")
-        yield {"type": "error", "stage": stage, "message": str(e)}
+        log.exception("LLM failure at stage=%s", stage)
+
+        partial_files = dict(delivery_files or last_successful_files)
+
+        if partial_files:
+            session.files = dict(partial_files)
+
+        if plan:
+            session.plan = plan
+
+        error_message = (
+            f"LLM request failed during {stage}: {e}"
+        )
+
+        reply = (
+            format_reply(
+                lang=lang,
+                approved=False,
+                attempts=attempts,
+                plan=plan,
+                files=partial_files,
+                issues=[error_message],
+                failure=error_message,
+            )
+            if partial_files
+            else error_message
+        )
+
+        session.history.append({
+            "role": "assistant",
+            "content": reply[:600],
+        })
+
+        yield log_event("system", error_message)
+
+        yield {
+            "type": "final",
+            "status": "partial_error" if partial_files else "error",
+            "attempts": attempts,
+            "reply": reply,
+            "t": round(time.perf_counter() - t0, 1),
+        }
+
     except Exception as e:
         error_message = f'Falló en la etapa "{stage}": {e}'
         log.exception(error_message)
 
-        # delivery_files se actualiza tras cada respuesta válida del Coder
-        # y del Documenter, por lo que conserva lo ya generado.
+        # Preserve any accepted or partially generated files.
         partial_files = dict(delivery_files)
+
         if partial_files:
             session.files = partial_files
+
         if plan:
             session.plan = plan
 
         reply = (
             format_reply(
                 lang=lang,
-                approved=False,
+                approved=approved,
                 attempts=attempts,
                 plan=plan,
                 files=partial_files,
@@ -422,12 +994,21 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             else error_message
         )
 
-        session.history.append({"role": "assistant", "content": reply[:600]})
-        yield log_event("system", error_message)
+        session.history.append({
+            "role": "assistant",
+            "content": reply[:600],
+        })
+
+        yield log_event(
+            "system",
+            error_message,
+        )
+
         yield {
             "type": "final",
             "status": "partial_error" if partial_files else "error",
             "reply": reply,
-            "t": round(time.time() - t0, 1),
+            "t": round(time.perf_counter() - t0, 1),
         }
+
         return

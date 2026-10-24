@@ -39,6 +39,10 @@ class Settings:
     llm_timeout: float
     max_sessions: int
     fallback_timeout: float
+    groq_tpm_budget: int = 5900
+    groq_wait_seconds: float = 5.0
+    groq_cooldown_seconds: float = 60.0
+    fallback_timeout: float = 90.0
 
     def model_for(self, role: str) -> str:
         per_role = {
@@ -64,6 +68,10 @@ def get_settings() -> Settings:
         fallback_model=os.getenv("FALLBACK_MODEL", ""),
         max_retries=max(0, _int("MAX_RETRIES", 5)),
         llm_timeout=_float("LLM_TIMEOUT_SECONDS", 60),
-        fallback_timeout=_float("FALLBACK_TIMEOUT_SECONDS", 90),
+        fallback_timeout=_float("FALLBACK_TIMEOUT_SECONDS", 180),
         max_sessions=_int("MAX_SESSIONS", 400),
+        groq_tpm_budget=_int("GROQ_TPM_BUDGET", 5900),
+        groq_wait_seconds=_float("GROQ_WAIT_SECONDS", 5.0),
+        groq_cooldown_seconds=_float("GROQ_COOLDOWN_SECONDS", 60.0),
+
     )
