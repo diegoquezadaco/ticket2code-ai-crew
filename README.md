@@ -5,7 +5,7 @@ Ticket2Code AI Crew transforms natural-language software requests into reviewed 
 You can run it locally using Ollama or a hosted language model, or deploy the web application to make it accessible through a public URL.
 
 **Links**
-- **Live demo:** [Try the deployed application](https://YOUR-DEPLOYED-APP-URL) *(Replace this placeholder with the actual deployment URL before publishing.)*
+- **Live demo:** [Try the deployed application](https://ticket2code-ai-crew.onrender.com/)
 - **Source code:** [GitHub repository](https://github.com/diegoquezadaco/ticket2code-ai-crew)
 
 ## Overview
