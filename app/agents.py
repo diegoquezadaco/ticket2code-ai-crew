@@ -9,6 +9,7 @@ from .llm import LLMClient, LLMError
 
 LANG_NAMES = {"es": "Spanish", "en": "English"}
 INTENTS = ("new_ticket", "change_request", "question", "chat", "clarification")
+PROJECT_EXTRACT_COMMAND = "unzip project.zip -d project && cd project"
 
 ROUTER_SYS = (
     "Classify the latest message using conversation history and delivered work. "
@@ -65,8 +66,12 @@ REVIEWER_SYS = (
 
 DOCUMENTARIAN_SYS = (
     "Own README.md only. Use the deterministic_commands supplied in the plan as the source"
-    "of truth for setup, installation, testing, and run instructions."
-    "Do not invent or modify commands. Document only files and functionality present in the accepted implementation."
+    " of truth for setup, installation, testing, and run instructions. "
+    "Include an explicit first step telling users to download project.zip from the chat,"
+    "then open a terminal where it was saved and extract it into a project folder with"
+    f" this exact command: {PROJECT_EXTRACT_COMMAND}. Continue setup instructions from "
+    "inside that extracted project folder. "
+    "Do not invent or modify commands. Document only files and functionality present in the accepted implementation. "
     "Do not modify source files or tests. Output the complete README between these markers:\n"
     "### README_CONTENT_START\n"
     "README content\n"
@@ -498,6 +503,7 @@ def document_project(
         f"Deterministic commands:\n{json.dumps(commands, ensure_ascii=False)}\n\n"
         f"Project files, including executable tests:\n{render_files(doc_files, 4500)}\n\n"
         f"Reviewer documentation feedback to address:\n{feedback_text}\n\n"
+        "Write the download-and-extract instructions in the requested language. "
         "Return a complete README.md. Do not omit sections just because a command is unavailable."
     )
 
@@ -539,6 +545,37 @@ def document_project(
     if not readme:
         raise LLMError("the Documentation Agent returned an empty README")
 
+    readme_lower = readme.lower()
+    mentions_download = "download" in readme_lower or "descarg" in readme_lower
+    mentions_continuation = (
+        "continue" in readme_lower or "contin" in readme_lower
+    )
+    if (
+        not mentions_download
+        or "project.zip" not in readme_lower
+        or PROJECT_EXTRACT_COMMAND.lower() not in readme_lower
+        or not mentions_continuation
+    ):
+        if lang == "es":
+            readme += (
+                "\n## Descargar y descomprimir el proyecto\n\n"
+                "Descarga `project.zip` desde el chat y guárdalo en la "
+                "ubicación donde quieras crear el proyecto. Abre una terminal "
+                "en esa ubicación y ejecuta:\n\n"
+                f"```bash\n{PROJECT_EXTRACT_COMMAND}\n```\n\n"
+                "Después, continúa con los pasos de instalación, pruebas y "
+                "ejecución de este README desde la carpeta del proyecto.\n"
+            )
+        else:
+            readme += (
+                "\n## Download and extract the project\n\n"
+                "Download `project.zip` from the chat and save it where you "
+                "want to create the project. Open a terminal there and run:\n\n"
+                f"```bash\n{PROJECT_EXTRACT_COMMAND}\n```\n\n"
+                "Then continue with the installation, test, and run steps "
+                "in this README from the project folder.\n"
+            )
+
     return readme
 
 
@@ -578,7 +615,7 @@ def handle_chat_message(llm: LLMClient, message: str, history: list, summary: st
 
 
 def documentation_checks(plan: dict, files: dict) -> list[str]:
-    """Comprueba que README.md exista y documente los comandos detectados."""
+    """Check that the README documents project extraction and detected commands."""
     readme = next(
         (
             content for path, content in files.items()
@@ -588,6 +625,23 @@ def documentation_checks(plan: dict, files: dict) -> list[str]:
     )
     if readme is None:
         return ["README.md is missing."]
+
+    readme_lower = readme.lower()
+    mentions_download = "download" in readme_lower or "descarg" in readme_lower
+    mentions_continuation = (
+        "continue" in readme_lower or "contin" in readme_lower
+    )
+    if (
+        not mentions_download
+        or "project.zip" not in readme_lower
+        or PROJECT_EXTRACT_COMMAND.lower() not in readme_lower
+        or not mentions_continuation
+    ):
+        return [
+            "README.md must explicitly explain downloading project.zip, "
+            f"extracting it with `{PROJECT_EXTRACT_COMMAND}`, and continuing "
+            "with the remaining setup steps."
+        ]
 
     commands = get_deterministic_commands(files)
     required_commands = commands["install"] + commands["run"] + commands["test"]

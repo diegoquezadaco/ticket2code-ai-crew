@@ -1,4 +1,6 @@
+import io
 import json
+import zipfile
 
 from fastapi.testclient import TestClient
 
@@ -25,6 +27,23 @@ def test_chat_streams_logs_then_final_and_exposes_trace(monkeypatch):
     assert trace["runs"][0]["request"] == "add coupon validation"
 
 
+def test_project_download_contains_every_session_file():
+    session_id = "project-download-test"
+    main.store.get_or_create(session_id).files = {
+        "src/main.py": "print('hello')\n",
+        "README.md": "# Project\n",
+    }
+
+    download = TestClient(main.app).get(
+        f"/api/sessions/{session_id}/download"
+    )
+    assert download.status_code == 200
+    assert download.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+        assert set(archive.namelist()) == {"src/main.py", "README.md"}
+        assert archive.read("src/main.py").decode() == "print('hello')\n"
+
+
 def test_invalid_session_id_is_rejected():
     r = TestClient(main.app).post("/api/chat", json={"session_id": "short", "message": "hi"})
     assert r.status_code == 422
@@ -32,3 +51,9 @@ def test_invalid_session_id_is_rejected():
 
 def test_unknown_trace_is_404():
     assert TestClient(main.app).get("/api/sessions/nope-nope-nope/trace").status_code == 404
+
+
+def test_project_download_requires_generated_files():
+    main.store.get_or_create("empty-project-test").files.clear()
+    response = TestClient(main.app).get("/api/sessions/empty-project-test/download")
+    assert response.status_code == 404

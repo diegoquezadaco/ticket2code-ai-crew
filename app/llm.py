@@ -343,7 +343,7 @@ class LLMClient:
             self._make(
                 fallback_key,
                 fallback_url,
-                getattr(settings, "fallback_timeout", 180),
+                getattr(settings, "fallback_timeout", 380),
             )
             if has_fallback
             else None

@@ -8,7 +8,11 @@ import re
 from typing import Iterator
 
 from . import agents
-from .agents import generate_file_tree, get_deterministic_commands
+from .agents import (
+    PROJECT_EXTRACT_COMMAND,
+    generate_file_tree,
+    get_deterministic_commands,
+)
 from .config import Settings
 from .llm import LLMError
 from .session import Session
@@ -81,17 +85,39 @@ def format_reply(
     # 2. Agregar el Paso a Paso determinista
     commands = get_deterministic_commands(files)
     step_lines = []
-    if any(path.endswith(".py") for path in files):
-        step_lines.append(
-            "1. Guarda los archivos respetando el árbol anterior y abre una terminal "
-            "en la carpeta raíz del proyecto."
-            if lang == "es" else
-            "1. Save the files following the tree above, then open a terminal in the project root."
-        )
-        step_lines.append("2. Create and activate a virtual environment:\n   ```bash\n   python3 -m venv .venv && source .venv/bin/activate\n   ```")
+    if files:
+        if lang == "es":
+            step_lines.append(
+                "1. Descarga `project.zip` con el botón «Descargar proyecto ZIP» "
+                "y guárdalo en la ubicación donde quieras crear el proyecto."
+            )
+            step_lines.append(
+                "2. Abre una terminal en la ubicación donde guardaste el ZIP, "
+                "descomprímelo y entra en la carpeta del proyecto:\n"
+                f"   ```bash\n   {PROJECT_EXTRACT_COMMAND}\n   ```"
+            )
+        else:
+            step_lines.append(
+                "1. Download `project.zip` with the download button and save it "
+                "where you want to create the project."
+            )
+            step_lines.append(
+                "2. Open a terminal where you saved the ZIP, extract it, and "
+                "enter the project folder:\n"
+                f"   ```bash\n   {PROJECT_EXTRACT_COMMAND}\n   ```"
+            )
         next_number = 3
     else:
         next_number = 1
+
+    if any(path.endswith(".py") for path in files):
+        step_lines.append(
+            f"{next_number}. Create and activate a virtual environment:\n"
+            "   ```bash\n"
+            "   python3 -m venv .venv && source .venv/bin/activate\n"
+            "   ```"
+        )
+        next_number += 1
 
     for command in commands["install"]:
         step_lines.append(f"{next_number}. Install dependencies:\n   ```bash\n   {command}\n   ```")
@@ -918,6 +944,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             "status": status,
             "attempts": attempts,
             "max_attempts": max_attempts,
+            "file_count": len(files),
             "reply": reply,
             "t": round(time.perf_counter() - t0, 1),
         }
@@ -963,6 +990,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
             "type": "final",
             "status": "partial_error" if partial_files else "error",
             "attempts": attempts,
+            "file_count": len(partial_files),
             "reply": reply,
             "t": round(time.perf_counter() - t0, 1),
         }
@@ -1007,6 +1035,7 @@ def run_turn(session: Session, message: str, llm, settings: Settings) -> Iterato
         yield {
             "type": "final",
             "status": "partial_error" if partial_files else "error",
+            "file_count": len(partial_files),
             "reply": reply,
             "t": round(time.perf_counter() - t0, 1),
         }

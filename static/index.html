@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ticket → Código</title>
+<title>Ticket → Code</title>
 <style>
   :root { --bg:#f6f6f4; --panel:#fff; --text:#1d1d1b; --muted:#6b6b66; --line:#e2e2dd; --accent:#3b5bdb;
           --ok:#1b7f3b; --warn:#b45309; --err:#b42318; --code:#f0f0ec; }
@@ -68,6 +68,34 @@
   .markdown code.inline-code { padding: 1px 5px; border-radius: 4px; background: var(--code); }
   .code-language { position: absolute; top: 9px; left: 12px; color: var(--muted); font-size: 11px; }
   .copy-code { z-index: 1; }
+  .download-link {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .work-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: var(--muted);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  .work-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: work-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes work-pulse {
+    50% { opacity: .35; }
+  }
 </style>
 </head>
 <body>
@@ -92,6 +120,12 @@ if (!sessionId || sessionId.length < 8) newSession();
 
 function el(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
 function scroll() { chat.scrollTop = chat.scrollHeight; }
+function formatElapsed(startedAt) {
+  const seconds = Math.floor((performance.now() - startedAt) / 1000);
+  const minutes = String(Math.floor(seconds / 60)).padStart(2, '0');
+  const remainder = String(seconds % 60).padStart(2, '0');
+  return `${minutes}:${remainder}`;
+}
 
 function addRow(parent, event) {
   const row = el('div', 'row');
@@ -288,20 +322,57 @@ function renderReply(parent, text) {
 async function sendMessage(text) {
   chat.appendChild(el('div', 'msg user', text));
   const bubble = el('div', 'msg'); const body = el('div');
-  const log = el('details', 'log'); log.open = true;
-  const summary = el('summary', '', 'Trabajando… log de agentes'); const list = el('div');
+  const startedAt = performance.now();
+  const workStatus = el('div', 'work-status');
+  workStatus.append(
+    el('span', 'work-indicator'),
+    el('span', 'work-label', 'Trabajando…'),
+    el('time', 'work-elapsed', formatElapsed(startedAt))
+  );
+  const log = el('details', 'log');
+  const summary = el('summary', '', 'Preparando actividad…'); const list = el('div');
   log.append(summary, list); bubble.append(log, body); chat.appendChild(bubble); scroll();
   send.disabled = true; input.disabled = true;
   let steps = 0, finished = false;
-  const showError = (msg) => { bubble.classList.add('error'); body.appendChild(el('div', 'text', msg)); finished = true; };
+  const elapsedLabel = workStatus.querySelector('.work-elapsed');
+  const workLabel = workStatus.querySelector('.work-label');
+  const timer = window.setInterval(() => {
+    elapsedLabel.textContent = formatElapsed(startedAt);
+  }, 1000);
+  const stopWorking = (label) => {
+    finished = true;
+    window.clearInterval(timer);
+    workLabel.textContent = label;
+    elapsedLabel.textContent = formatElapsed(startedAt);
+    workStatus.querySelector('.work-indicator').style.animation = 'none';
+  };
+  const showError = (msg) => {
+    bubble.classList.add('error');
+    body.appendChild(el('div', 'text', msg));
+    stopWorking('Falló');
+  };
+  bubble.insertBefore(workStatus, log);
   const handle = (ev) => {
-    if (ev.type === 'log') { steps++; addRow(list, ev); }
+    if (ev.type === 'log') {
+      steps++;
+      addRow(list, ev);
+      summary.textContent = `Ahora: ${ev.agent || 'system'} — ${ev.message || 'Trabajando…'}`;
+    }
     else if (ev.type === 'final') {
-      finished = true;
+      stopWorking('Terminado');
       const labels = { approved: 'Aprobado', not_approved: 'No aprobado (reintentos agotados)', answer: 'Respuesta' };
       body.appendChild(el('span', 'badge ' + ev.status, labels[ev.status] + (ev.attempts ? ` · ${ev.attempts}/${ev.max_attempts} intentos` : '') + ` · ${ev.t}s`));
       renderReply(body, ev.reply);
-    } else if (ev.type === 'error') showError(`Falló en la etapa "${ev.stage}": ${ev.message}`);
+      if (ev.file_count > 0) {
+        const download = el('a', 'download-link', 'Descargar proyecto ZIP');
+        download.href = `/api/sessions/${encodeURIComponent(sessionId)}/download`;
+        download.download = 'project.zip';
+        body.appendChild(download);
+      }
+    } else if (ev.type === 'error') {
+      summary.textContent = `Ahora: ${ev.stage || 'system'} — ${ev.message}`;
+      showError(`Falló en la etapa "${ev.stage}": ${ev.message}`);
+    }
     scroll();
   };
   try {
@@ -318,6 +389,8 @@ async function sendMessage(text) {
       if (!finished) showError('La conexión se cerró antes de terminar. Revisa el log de arriba y vuelve a intentar.');
     }
   } catch (e) { showError('No se pudo contactar al servidor: ' + e.message); }
+  window.clearInterval(timer);
+  if (!finished) stopWorking('Falló');
   summary.textContent = `Log de agentes (${steps} pasos)`; log.open = false;
   send.disabled = false; input.disabled = false; input.focus(); scroll();
 }
