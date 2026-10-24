@@ -1,0 +1,1 @@
+"""Ticket2Code application package."""

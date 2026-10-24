@@ -1,4 +1,4 @@
-"""Scripted stand-in for LLMClient so the pipeline can be tested offline and deterministically."""
+"""Scripted LLM client stand-in for deterministic, offline tests."""
 from app.llm import LLMError
 
 
@@ -6,7 +6,7 @@ class FakeLLM:
     configured = True
 
     def __init__(self, script):
-        # role -> list of responses; the last one repeats. An Exception instance is raised.
+        # Reuse the last scripted response; raise scripted exceptions.
         self.script = {role: list(items) for role, items in script.items()}
         self.calls = []
 

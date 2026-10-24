@@ -1,9 +1,11 @@
+"""Tests for the agent pipeline, delivery formatting, and documentation."""
+
 from dataclasses import replace
 
 from app import agents
 from app.config import get_settings
 from app.llm import LLMError, parse_json
-from app.pipeline import run_turn
+from app.pipeline import format_reply, run_turn
 from app.session import Session
 
 from .fakes import APPROVE, BROKEN_CODE, GOOD_CODE, PLAN, REJECT, FakeLLM, route
@@ -104,3 +106,51 @@ def test_parse_files_rejects_unsafe_paths():
 
 def test_parse_json_tolerates_fences_and_prose():
     assert parse_json('Here:\n```json\n{"a": 1}\n```') == {"a": 1}
+
+
+def test_spanish_delivery_steps_start_with_zip_download_and_extraction():
+    reply = format_reply(
+        lang="es",
+        approved=True,
+        attempts=1,
+        plan={},
+        files={"app.py": "print('hello')\n"},
+        issues=[],
+    )
+
+    steps = reply.split("### Paso a paso para continuar:\n", 1)[1]
+    assert "1. Descarga `project.zip`" in steps
+    assert "2. Abre una terminal" in steps
+    assert "unzip project.zip -d project && cd project" in steps
+    assert "3. Create and activate a virtual environment:" in steps
+
+
+def test_readme_checks_require_zip_download_and_extraction_instructions():
+    files = {
+        "app.py": "print('hello')\n",
+        "README.md": (
+            "Download project.zip, then run "
+            "`unzip project.zip -d project && cd project`, then continue "
+            "with the setup steps below."
+        ),
+    }
+    assert agents.documentation_checks({}, files) == []
+
+    files["README.md"] = "# App\n"
+    issues = agents.documentation_checks({}, files)
+    assert len(issues) == 1
+    assert "project.zip" in issues[0]
+
+
+def test_document_project_adds_download_instructions_when_missing():
+    llm = FakeLLM({"documentarian": ["# Generated app"]})
+    readme = agents.document_project(
+        llm,
+        plan={},
+        files={"app.py": "print('hello')\n"},
+        lang="en",
+    )
+
+    assert "Download `project.zip` from the chat" in readme
+    assert "unzip project.zip -d project && cd project" in readme
+    assert "Then continue with the installation" in readme
